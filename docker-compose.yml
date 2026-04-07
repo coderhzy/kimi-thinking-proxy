@@ -4,6 +4,14 @@ services:
     container_name: kimi-thinking-proxy
     ports:
       - "8919:8919"
+    environment:
+      PORT: 8919
+      HOST: 0.0.0.0
     volumes:
       - ./config.json:/app/config.json:ro
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8919/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
