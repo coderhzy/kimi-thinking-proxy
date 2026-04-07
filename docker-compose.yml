@@ -1,0 +1,9 @@
+services:
+  kimi-thinking-proxy:
+    build: .
+    container_name: kimi-thinking-proxy
+    ports:
+      - "8919:8919"
+    volumes:
+      - ./config.json:/app/config.json:ro
+    restart: unless-stopped

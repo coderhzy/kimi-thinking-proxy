@@ -1,0 +1,11 @@
+{
+  "name": "kimi-thinking-proxy",
+  "version": "0.1.0",
+  "private": false,
+  "description": "OpenAI-compatible proxy for Kimi coding/thinking with multi-key rotation, health checks, and alerting.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "license": "MIT"
+}
