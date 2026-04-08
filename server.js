@@ -19,10 +19,9 @@ const DEFAULT_CONFIG = {
   max_retries: 2,
   request_timeout_ms: 120000,
   keys: [],
-  telegram: {
+  feishu: {
     enabled: false,
-    bot_token: '',
-    chat_id: ''
+    webhook: ''
   }
 };
 
@@ -61,7 +60,7 @@ function envNumber(name, fallback) {
 
 function mergeConfig(base, extra) {
   const merged = Object.assign({}, base, extra || {});
-  merged.telegram = Object.assign({}, base.telegram || {}, (extra || {}).telegram || {});
+  merged.feishu = Object.assign({}, base.feishu || {}, (extra || {}).feishu || {});
   return merged;
 }
 
@@ -91,10 +90,9 @@ function loadConfig() {
       })).filter(item => item.key);
     }
 
-    cfg.telegram = cfg.telegram || {};
-    cfg.telegram.enabled = envBool('TELEGRAM_ENABLED', cfg.telegram.enabled);
-    cfg.telegram.bot_token = process.env.TELEGRAM_BOT_TOKEN || cfg.telegram.bot_token || '';
-    cfg.telegram.chat_id = process.env.TELEGRAM_CHAT_ID || cfg.telegram.chat_id || '';
+    cfg.feishu = cfg.feishu || {};
+    cfg.feishu.enabled = envBool('FEISHU_ENABLED', cfg.feishu.enabled);
+    cfg.feishu.webhook = process.env.FEISHU_WEBHOOK || cfg.feishu.webhook || '';
 
     console.log('[INFO] 配置已加载:', {
       config_path: DEFAULT_CONFIG_PATH,
@@ -150,21 +148,21 @@ function markRoute(url) {
   stats.perRoute[route] = (stats.perRoute[route] || 0) + 1;
 }
 
-function sendTelegram(text) {
-  if (!CONFIG.telegram || !CONFIG.telegram.enabled || !CONFIG.telegram.bot_token || !CONFIG.telegram.chat_id) {
+function sendFeishu(text) {
+  if (!CONFIG.feishu || !CONFIG.feishu.enabled || !CONFIG.feishu.webhook) {
     return;
   }
 
   const body = JSON.stringify({
-    chat_id: CONFIG.telegram.chat_id,
-    text,
-    parse_mode: 'Markdown'
+    msg_type: 'text',
+    content: { text }
   });
 
+  const url = new URL(CONFIG.feishu.webhook);
   const req = https.request({
-    hostname: 'api.telegram.org',
+    hostname: url.hostname,
     port: 443,
-    path: `/bot${CONFIG.telegram.bot_token}/sendMessage`,
+    path: url.pathname + url.search,
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -176,7 +174,7 @@ function sendTelegram(text) {
   });
 
   req.on('error', function (error) {
-    console.log('[WARN] Telegram 通知失败:', error.message);
+    console.log('[WARN] 飞书通知失败:', error.message);
   });
 
   req.write(body);
@@ -235,7 +233,7 @@ function markKeyError(keyObj, message) {
     keyObj.enabled = false;
     keyObj.disabledUntil = Date.now() + 5 * 60 * 1000;
     console.log('[WARN] Key', keyObj.name, '连续失败，禁用 5 分钟');
-    sendTelegram(`⚠️ *Kimi Proxy*\nKey ${keyObj.name} 连续失败，已禁用 5 分钟\n原因: ${keyObj.lastError}`);
+    sendFeishu(`[Kimi Proxy] Key ${keyObj.name} 连续失败，已禁用 5 分钟\n原因: ${keyObj.lastError}`);
   }
 }
 
@@ -351,7 +349,7 @@ function formatHealth() {
     enabled_keys: enabledKeys,
     target_host: CONFIG.target_host,
     target_path_prefix: CONFIG.target_path_prefix,
-    features: ['thinking', 'vision', 'function_call', 'stream', 'json_clean', 'multi_key', 'telegram_alert', 'metrics', 'env_override'],
+    features: ['thinking', 'vision', 'function_call', 'stream', 'json_clean', 'multi_key', 'feishu_alert', 'metrics', 'env_override'],
     keys: keyPool.map(function (k) {
       return {
         name: k.name,
@@ -547,7 +545,7 @@ const server = http.createServer(function (req, res) {
       stats.requestsFailed += 1;
       res.writeHead(503, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: { message: '所有 key 不可用', type: 'service_unavailable' } }));
-      sendTelegram('🚨 *Kimi Proxy*: 所有 Key 不可用');
+      sendFeishu('[Kimi Proxy] 所有 Key 不可用，服务降级');
       return;
     }
 
@@ -606,6 +604,6 @@ server.listen(CONFIG.port || 8919, CONFIG.host || '0.0.0.0', function () {
   console.log('  Upstream: https://' + CONFIG.target_host + (CONFIG.target_path_prefix || ''));
   console.log('  Key 数: ' + keyPool.length);
   console.log('  限流: ' + (CONFIG.rate_limit_rpm || 30) + ' RPM/key');
-  console.log('  功能: 思考链 | 图片转Base64 | Function Call修复 | JSON清理 | 多Key轮询 | Telegram告警 | Metrics | 环境变量覆盖');
+  console.log('  功能: 思考链 | 图片转Base64 | Function Call修复 | JSON清理 | 多Key轮询 | 飞书告警 | Metrics | 环境变量覆盖');
   console.log('========================================');
 });
