@@ -222,6 +222,26 @@ function markKeySuccess(keyObj) {
   keyObj.lastError = '';
 }
 
+function isQuotaError(statusCode, body) {
+  if (statusCode === 402) return true;
+  if (statusCode === 429) {
+    const text = (body || '').toLowerCase();
+    if (/quota|balance|insufficient|exceeded|limit/.test(text)) return true;
+  }
+  return false;
+}
+
+function markKeyQuotaExhausted(keyObj) {
+  if (!keyObj) return;
+  keyObj.enabled = false;
+  keyObj.disabledUntil = Date.now() + 24 * 60 * 60 * 1000;
+  keyObj.lastError = 'quota exhausted';
+  keyObj.lastErrorTime = Date.now();
+  keyObj.errorCount += 1;
+  console.log('[WARN] Key', keyObj.name, '额度耗尽，禁用 1 天');
+  sendFeishu(`[Kimi Proxy] Key ${keyObj.name} 额度耗尽，已禁用 1 天`);
+}
+
 function markKeyError(keyObj, message) {
   if (!keyObj) return;
   keyObj.errorCount += 1;
@@ -231,9 +251,9 @@ function markKeyError(keyObj, message) {
 
   if (keyObj.consecutiveErrors >= 3) {
     keyObj.enabled = false;
-    keyObj.disabledUntil = Date.now() + 5 * 60 * 1000;
-    console.log('[WARN] Key', keyObj.name, '连续失败，禁用 5 分钟');
-    sendFeishu(`[Kimi Proxy] Key ${keyObj.name} 连续失败，已禁用 5 分钟\n原因: ${keyObj.lastError}`);
+    keyObj.disabledUntil = Date.now() + 24 * 60 * 60 * 1000;
+    console.log('[WARN] Key', keyObj.name, '连续失败，禁用 1 天');
+    sendFeishu(`[Kimi Proxy] Key ${keyObj.name} 连续失败，已禁用 1 天\n原因: ${keyObj.lastError}`);
   }
 }
 
@@ -442,7 +462,11 @@ function proxyRequest(req, res, bodyStr, keyObj, retryCount) {
           markKeySuccess(keyObj);
           stats.requestsSucceeded += 1;
         } else {
-          markKeyError(keyObj, `HTTP ${proxyRes.statusCode}`);
+          if (isQuotaError(proxyRes.statusCode, '')) {
+            markKeyQuotaExhausted(keyObj);
+          } else {
+            markKeyError(keyObj, `HTTP ${proxyRes.statusCode}`);
+          }
           stats.requestsFailed += 1;
         }
         res.end();
@@ -459,7 +483,11 @@ function proxyRequest(req, res, bodyStr, keyObj, retryCount) {
         markKeySuccess(keyObj);
         stats.requestsSucceeded += 1;
       } else {
-        markKeyError(keyObj, `HTTP ${proxyRes.statusCode}`);
+        if (isQuotaError(proxyRes.statusCode, respBody)) {
+          markKeyQuotaExhausted(keyObj);
+        } else {
+          markKeyError(keyObj, `HTTP ${proxyRes.statusCode}`);
+        }
         stats.requestsFailed += 1;
       }
 
