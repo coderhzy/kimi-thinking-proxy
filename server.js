@@ -19,6 +19,11 @@ const DEFAULT_CONFIG = {
   max_retries: 2,
   request_timeout_ms: 120000,
   keys: [],
+  models: [
+    { id: 'kimi-k2.5-thinking', name: 'Kimi K2.5 Thinking' },
+    { id: 'kimi-for-coding', name: 'Kimi for Coding' },
+    { id: 'K2.6-code-preview', name: 'Kimi K2.6 Code Preview' }
+  ],
   feishu: {
     enabled: false,
     webhook: ''
@@ -359,6 +364,21 @@ function normalizeStreamChunk(chunk) {
   return out.join('\n');
 }
 
+function formatModels() {
+  const models = CONFIG.models || DEFAULT_CONFIG.models || [];
+  return {
+    object: 'list',
+    data: models.map(function (m) {
+      return {
+        id: m.id,
+        object: 'model',
+        created: Math.floor(stats.startTime / 1000),
+        owned_by: 'moonshot'
+      };
+    })
+  };
+}
+
 function formatHealth() {
   const enabledKeys = keyPool.filter(k => k.enabled).length;
   return {
@@ -558,6 +578,12 @@ const server = http.createServer(function (req, res) {
   if (req.url === '/metrics') {
     res.writeHead(200, { 'Content-Type': 'text/plain; version=0.0.4; charset=utf-8' });
     res.end(formatMetrics());
+    return;
+  }
+
+  if (req.url === '/v1/models' && req.method === 'GET') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(formatModels()));
     return;
   }
 
