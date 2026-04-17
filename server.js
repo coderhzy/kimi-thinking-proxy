@@ -362,7 +362,7 @@ function markKeyDead(keyObj, reason) {
 
 function probeKey(keyObj) {
   const cfg = CONFIG.probe_check || {};
-  if (!cfg.enabled || !keyObj || !keyObj.key) return;
+  if (!keyObj || !keyObj.key) return;
 
   const body = JSON.stringify({
     model: cfg.model || 'kimi-for-coding',
@@ -956,7 +956,9 @@ dialog::backdrop{background:rgba(0,0,0,.6)}
 <div class="bar">
   <button id="addBtn">+ 添加 Key</button>
   <button class="secondary" id="refreshBtn">刷新</button>
+  <button class="secondary" id="probeBtn" title="向所有 key 发一条极小探测请求，确认真实状态">🔬 立即检测</button>
   <span class="muted" id="lastUpdate"></span>
+  <span class="muted" id="nextProbe"></span>
 </div>
 <div id="err"></div>
 <table>
@@ -1088,6 +1090,44 @@ document.getElementById('addBtn').onclick = () => {
   dlg.showModal();
 };
 document.getElementById('refreshBtn').onclick = load;
+
+const PROBE_INTERVAL_MS = 20 * 60 * 1000;
+let lastProbeAt = 0;
+let nextProbeAt = Date.now() + PROBE_INTERVAL_MS;
+
+async function runProbe(triggered) {
+  const btn = document.getElementById('probeBtn');
+  btn.disabled = true;
+  btn.textContent = triggered === 'auto' ? '⏱ 自动检测中...' : '🔬 检测中...';
+  try {
+    await api('POST', '/admin/api/probe');
+    await new Promise(r => setTimeout(r, 3500));
+    await load();
+    lastProbeAt = Date.now();
+    nextProbeAt = lastProbeAt + PROBE_INTERVAL_MS;
+  } catch (e) {
+    document.getElementById('err').innerHTML = '<div class="error">检测失败: ' + e.message + '</div>';
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '🔬 立即检测';
+  }
+}
+
+document.getElementById('probeBtn').onclick = () => runProbe('manual');
+
+function updateNextProbe() {
+  const el = document.getElementById('nextProbe');
+  const remain = Math.max(0, nextProbeAt - Date.now());
+  if (!lastProbeAt) { el.textContent = ''; return; }
+  const mins = Math.floor(remain / 60000);
+  const secs = Math.floor((remain % 60000) / 1000);
+  el.textContent = '下次自动检测 ' + (mins > 0 ? mins + 'm' : secs + 's');
+}
+setInterval(updateNextProbe, 1000);
+
+setInterval(function () {
+  if (Date.now() >= nextProbeAt) runProbe('auto');
+}, 30000);
 document.getElementById('dlgCancel').onclick = () => dlg.close();
 document.getElementById('dlgSave').onclick = async () => {
   const payload = {
@@ -1132,8 +1172,11 @@ window.del = async function(idx) {
   catch(e) { document.getElementById('err').innerHTML = '<div class="error">' + e.message + '</div>'; }
 };
 
-load();
-setInterval(load, 10000);
+(async () => {
+  await load();
+  await runProbe('auto');
+})();
+setInterval(load, 15000);
 </script>
 </body>
 </html>`;
@@ -1160,6 +1203,18 @@ function handleAdminRequest(req, res) {
 
   if (req.url === '/admin/api/keys' && req.method === 'GET') {
     adminSendJson(res, 200, { keys: adminListKeys() });
+    return true;
+  }
+
+  if (req.url === '/admin/api/probe' && req.method === 'POST') {
+    let triggered = 0;
+    keyPool.forEach(function (key) {
+      if (key.probeStatus === 'invalid' || key.probeStatus === 'forbidden') return;
+      probeKey(key);
+      triggered += 1;
+    });
+    console.log(`[INFO] 管理端手动触发探活: ${triggered} 个 key`);
+    adminSendJson(res, 200, { ok: true, triggered });
     return true;
   }
 
