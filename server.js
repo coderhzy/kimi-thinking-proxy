@@ -19,9 +19,7 @@ const DEFAULT_CONFIG = {
   max_retries: 2,
   request_timeout_ms: 120000,
   disable_backoff_ms: [60000, 300000, 1800000, 3600000, 86400000],
-  force_temperature: {
-    'K2.6-code-preview': 0.6
-  },
+  force_temperature: {},
   keys: [],
   models: [
     { id: 'kimi-k2.5-thinking', name: 'Kimi K2.5 Thinking' },
