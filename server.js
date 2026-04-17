@@ -15,6 +15,7 @@ const DEFAULT_CONFIG = {
   target_path_prefix: '/coding',
   coding_ua: 'claude-cli/2.1.44 (external, sdk-cli)',
   auto_thinking: true,
+  thinking_budget_tokens: 512,
   rate_limit_rpm: 30,
   max_retries: 2,
   request_timeout_ms: 120000,
@@ -770,8 +771,14 @@ const server = http.createServer(function (req, res) {
     try {
       const json = JSON.parse(body || '{}');
 
-      if (CONFIG.auto_thinking && json.enable_thinking === undefined) {
-        json.enable_thinking = true;
+      if (CONFIG.auto_thinking && !json.thinking) {
+        json.thinking = {
+          type: 'enabled',
+          budget_tokens: CONFIG.thinking_budget_tokens || 512
+        };
+      }
+      if (json.enable_thinking !== undefined) {
+        delete json.enable_thinking;
       }
 
       const forcedTemps = CONFIG.force_temperature || {};
