@@ -833,9 +833,32 @@ function adminSendJson(res, statusCode, body) {
   res.end(s);
 }
 
+function deriveKeyState(k, rpm) {
+  if (k.probeStatus === 'invalid') return { level: 'dead', label: '失效', reason: 'HTTP 401 / key 过期' };
+  if (k.probeStatus === 'forbidden') return { level: 'dead', label: '已屏蔽', reason: 'HTTP 403' };
+  if (!k.enabled) {
+    if (k.probeStatus === 'quota_exhausted' || k.lastError === 'quota exhausted') {
+      return { level: 'quota', label: '额度耗尽', reason: '402 / 403 access_terminated' };
+    }
+    return { level: 'paused', label: '暂禁', reason: `退避 tier ${k.disableTier}` };
+  }
+  if (rpm && k.minuteRequests && k.minuteRequests.length >= rpm) {
+    return { level: 'throttle', label: '限流', reason: `当前分钟已用 ${k.minuteRequests.length}/${rpm}` };
+  }
+  if (k.consecutiveErrors >= 2) {
+    return { level: 'warn', label: '告警', reason: `连续 ${k.consecutiveErrors} 次错误` };
+  }
+  if (k.probeStatus && k.probeStatus !== 'healthy' && k.probeStatus.startsWith && k.probeStatus.startsWith('http_')) {
+    return { level: 'warn', label: '探活异常', reason: k.probeStatus };
+  }
+  return { level: 'ok', label: '正常', reason: k.probeStatus || 'healthy' };
+}
+
 function adminListKeys() {
+  const rpm = CONFIG.rate_limit_rpm || 30;
   return keyPool.map(function (k, idx) {
     const cfgKey = (CONFIG.keys || [])[idx] || {};
+    const state = deriveKeyState(k, rpm);
     return {
       index: idx,
       name: k.name,
@@ -844,11 +867,15 @@ function adminListKeys() {
       weight: k.weight,
       enabled: k.enabled,
       config_enabled: cfgKey.enabled !== false,
+      state_level: state.level,
+      state_label: state.label,
+      state_reason: state.reason,
       requests: k.requestCount,
       errors: k.errorCount,
       consecutive_errors: k.consecutiveErrors,
       disable_tier: k.disableTier,
       rpm_current: k.minuteRequests.length,
+      rpm_limit: rpm,
       disabled_until: k.disabledUntil || null,
       last_used: k.lastUsed || null,
       last_error: k.lastError || null,
@@ -899,10 +926,18 @@ tr:last-child td{border-bottom:0}
 tr:hover td{background:#1e293b}
 input,textarea{background:#0f172a;border:1px solid #334155;color:#e2e8f0;padding:6px 10px;border-radius:5px;font:inherit;width:100%}
 input:focus,textarea:focus{border-color:#3b82f6;outline:0}
-.pill{display:inline-block;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:600}
+.pill{display:inline-block;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:600;cursor:help}
 .pill-ok{background:#064e3b;color:#6ee7b7}
+.pill-throttle{background:#713f12;color:#fde68a}
 .pill-warn{background:#78350f;color:#fcd34d}
-.pill-bad{background:#7f1d1d;color:#fca5a5}
+.pill-paused{background:#3f1d7a;color:#c4b5fd}
+.pill-quota{background:#7c2d12;color:#fdba74}
+.pill-dead{background:#7f1d1d;color:#fca5a5}
+.status-cell{display:flex;flex-direction:column;gap:2px;align-items:flex-start}
+.rpm-bar{width:60px;height:4px;background:#334155;border-radius:2px;overflow:hidden}
+.rpm-bar>div{height:100%;background:#3b82f6;transition:width .3s}
+.rpm-bar.hot>div{background:#f97316}
+.rpm-bar.full>div{background:#dc2626}
 .mono{font-family:ui-monospace,SFMono-Regular,monospace;font-size:12px;color:#94a3b8}
 .actions{display:flex;gap:6px}
 .actions button{padding:4px 10px;font-size:12px}
@@ -962,14 +997,32 @@ async function api(method, path, body) {
   return j;
 }
 
+function fmtCountdown(ts) {
+  if (!ts) return '';
+  const secs = Math.max(0, Math.round((ts - Date.now()) / 1000));
+  if (secs <= 0) return '';
+  if (secs < 60) return secs + 's';
+  if (secs < 3600) return Math.round(secs/60) + 'min';
+  if (secs < 86400) return Math.round(secs/3600) + 'h';
+  return Math.round(secs/86400) + 'd';
+}
+
 function pill(k) {
-  if (!k.enabled) {
-    if (k.last_error && k.last_error.includes('401')) return '<span class="pill pill-bad">失效</span>';
-    if (k.last_error === 'quota exhausted') return '<span class="pill pill-warn">额度耗尽</span>';
-    return '<span class="pill pill-warn">已禁用</span>';
+  const cls = 'pill-' + k.state_level;
+  const title = (k.state_reason || '').replace(/"/g, '&quot;');
+  let extra = '';
+  if (k.disabled_until && k.state_level !== 'dead') {
+    const cd = fmtCountdown(k.disabled_until);
+    if (cd) extra = ' <span class="muted" style="font-size:10px">' + cd + '</span>';
   }
-  if (k.consecutive_errors >= 2) return '<span class="pill pill-warn">异常</span>';
-  return '<span class="pill pill-ok">正常</span>';
+  return '<span class="pill ' + cls + '" title="' + title + '">' + k.state_label + '</span>' + extra;
+}
+
+function rpmBar(k) {
+  const pct = Math.min(100, Math.round((k.rpm_current / k.rpm_limit) * 100));
+  const cls = pct >= 100 ? 'full' : (pct >= 80 ? 'hot' : '');
+  return '<div class="rpm-bar ' + cls + '"><div style="width:' + pct + '%"></div></div>'
+    + '<span class="muted" style="font-size:11px">' + k.rpm_current + '/' + k.rpm_limit + ' rpm</span>';
 }
 
 function render(data) {
@@ -981,7 +1034,7 @@ function render(data) {
       + '<td>' + k.name + '</td>'
       + '<td><span class="muted">' + (note || '-') + '</span></td>'
       + '<td class="mono">' + k.key_masked + '</td>'
-      + '<td>' + pill(k) + '</td>'
+      + '<td><div class="status-cell">' + pill(k) + rpmBar(k) + '</div></td>'
       + '<td>' + k.weight + '</td>'
       + '<td>' + k.requests + '</td>'
       + '<td>' + k.errors + (k.consecutive_errors ? ' <span class="muted">(连续 '+k.consecutive_errors+')</span>' : '') + '</td>'
@@ -995,9 +1048,17 @@ function render(data) {
 
   const totalReq = data.keys.reduce((s,k)=>s+k.requests,0);
   const totalErr = data.keys.reduce((s,k)=>s+k.errors,0);
-  const enabled = data.keys.filter(k=>k.enabled).length;
+  const counts = {};
+  data.keys.forEach(k => counts[k.state_level] = (counts[k.state_level] || 0) + 1);
+  const statOrder = [
+    ['ok', '正常'], ['throttle', '限流'], ['warn', '告警'],
+    ['paused', '暂禁'], ['quota', '额度耗尽'], ['dead', '失效']
+  ];
+  const statParts = statOrder.filter(([lv]) => counts[lv])
+    .map(([lv, label]) => '<div class="stat pill-' + lv + '" style="color:inherit"><b>' + counts[lv] + '</b> ' + label + '</div>');
   document.getElementById('stats').innerHTML =
-    '<div class="stat"><b>' + enabled + '/' + data.keys.length + '</b> 可用</div>'
+    '<div class="stat"><b>' + data.keys.length + '</b> 总 key</div>'
+    + statParts.join('')
     + '<div class="stat"><b>' + totalReq + '</b> 总请求</div>'
     + '<div class="stat"><b>' + totalErr + '</b> 总错误</div>';
   document.getElementById('lastUpdate').textContent = '更新于 ' + new Date().toLocaleTimeString();
