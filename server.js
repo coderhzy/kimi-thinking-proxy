@@ -19,6 +19,9 @@ const DEFAULT_CONFIG = {
   max_retries: 2,
   request_timeout_ms: 120000,
   disable_backoff_ms: [60000, 300000, 1800000, 3600000, 86400000],
+  force_temperature: {
+    'K2.6-code-preview': 0.6
+  },
   keys: [],
   models: [
     { id: 'kimi-k2.5-thinking', name: 'Kimi K2.5 Thinking' },
@@ -249,8 +252,15 @@ function markKeySuccess(keyObj) {
   keyObj.lastError = '';
 }
 
-function isQuotaError(statusCode) {
-  return statusCode === 402;
+function isQuotaError(statusCode, body) {
+  if (statusCode === 402) return true;
+  if (statusCode === 403 || statusCode === 429) {
+    const text = (body || '').toLowerCase();
+    if (text.includes('access_terminated_error')) return true;
+    if (text.includes('usage limit') || text.includes('billing cycle')) return true;
+    if (text.includes('quota') && (text.includes('exhaust') || text.includes('refresh') || text.includes('upgrade'))) return true;
+  }
+  return false;
 }
 
 function markKeyQuotaExhausted(keyObj) {
@@ -341,21 +351,30 @@ function probeKey(keyObj) {
     res.on('data', chunk => chunks.push(chunk));
     res.on('end', function () {
       keyObj.lastProbeAt = Date.now();
-      const text = Buffer.concat(chunks).toString('utf-8').slice(0, 300);
+      const fullText = Buffer.concat(chunks).toString('utf-8');
+      const text = fullText.slice(0, 300);
 
-      if (res.statusCode === 402) {
+      if (isQuotaError(res.statusCode, fullText)) {
         keyObj.probeStatus = 'quota_exhausted';
         if (keyObj.enabled) {
-          console.log(`[WARN] Key ${keyObj.name} 探活 402，额度耗尽`);
+          console.log(`[WARN] Key ${keyObj.name} 探活 HTTP ${res.statusCode}，额度耗尽`);
           markKeyQuotaExhausted(keyObj);
         }
-      } else if (res.statusCode === 401 || res.statusCode === 403) {
+      } else if (res.statusCode === 401) {
         keyObj.probeStatus = 'invalid';
-        if (keyObj.enabled) {
-          markKeyDead(keyObj, `HTTP ${res.statusCode}: ${text}`);
-        }
+        if (keyObj.enabled) markKeyDead(keyObj, `HTTP 401: ${text}`);
+      } else if (res.statusCode === 403) {
+        keyObj.probeStatus = 'forbidden';
+        if (keyObj.enabled) markKeyDead(keyObj, `HTTP 403: ${text}`);
       } else if (res.statusCode >= 200 && res.statusCode < 300) {
         keyObj.probeStatus = 'healthy';
+        if (!keyObj.enabled && keyObj.disabledUntil && keyObj.disabledUntil > Date.now()) {
+          console.log(`[INFO] Key ${keyObj.name} 探活成功，提前恢复`);
+          keyObj.enabled = true;
+          keyObj.disabledUntil = 0;
+          keyObj.consecutiveErrors = 0;
+          keyObj.disableTier = 0;
+        }
       } else {
         keyObj.probeStatus = `http_${res.statusCode}`;
       }
@@ -387,14 +406,15 @@ function startProbeChecker() {
   const interval = cfg.interval_ms || 600000;
   probeCheckerTimer = setInterval(function () {
     keyPool.forEach(function (key) {
-      if (!key.enabled) return;
+      if (key.probeStatus === 'invalid' || key.probeStatus === 'forbidden') return;
       probeKey(key);
     });
   }, interval);
   console.log(`[INFO] 探活检测已启动: model=${cfg.model || 'kimi-for-coding'}, 间隔=${Math.round(interval / 1000)}s`);
   setTimeout(function () {
     keyPool.forEach(function (key) {
-      if (key.enabled) probeKey(key);
+      if (key.probeStatus === 'invalid' || key.probeStatus === 'forbidden') return;
+      probeKey(key);
     });
   }, 5000);
 }
@@ -610,8 +630,11 @@ function proxyRequest(req, res, bodyStr, keyObj, retryCount) {
     }
 
     if (isStream) {
+      const isError = proxyRes.statusCode >= 400;
+      let errorBody = '';
       res.writeHead(proxyRes.statusCode, proxyRes.headers);
       proxyRes.on('data', function (chunk) {
+        if (isError) errorBody += chunk.toString('utf-8');
         try {
           res.write(normalizeStreamChunk(chunk));
         } catch (_) {
@@ -623,7 +646,7 @@ function proxyRequest(req, res, bodyStr, keyObj, retryCount) {
           markKeySuccess(keyObj);
           stats.requestsSucceeded += 1;
         } else {
-          if (isQuotaError(proxyRes.statusCode)) {
+          if (isQuotaError(proxyRes.statusCode, errorBody)) {
             markKeyQuotaExhausted(keyObj);
           } else {
             const transient = proxyRes.statusCode === 429 || proxyRes.statusCode >= 500;
@@ -645,7 +668,7 @@ function proxyRequest(req, res, bodyStr, keyObj, retryCount) {
         markKeySuccess(keyObj);
         stats.requestsSucceeded += 1;
       } else {
-        if (isQuotaError(proxyRes.statusCode)) {
+        if (isQuotaError(proxyRes.statusCode, respBody)) {
           markKeyQuotaExhausted(keyObj);
         } else {
           const transient = proxyRes.statusCode === 429 || proxyRes.statusCode >= 500;
@@ -751,6 +774,11 @@ const server = http.createServer(function (req, res) {
 
       if (CONFIG.auto_thinking && json.enable_thinking === undefined) {
         json.enable_thinking = true;
+      }
+
+      const forcedTemps = CONFIG.force_temperature || {};
+      if (json.model && typeof forcedTemps[json.model] === 'number') {
+        json.temperature = forcedTemps[json.model];
       }
 
       if (Array.isArray(json.messages)) {
