@@ -5,9 +5,11 @@
   "target_path_prefix": "/coding",
   "coding_ua": "claude-cli/2.1.44 (external, sdk-cli)",
   "auto_thinking": true,
+  "thinking_budget_tokens": 512,
   "rate_limit_rpm": 30,
   "max_retries": 2,
   "request_timeout_ms": 120000,
+  "retry_on_http_error": true,
   "disable_backoff_ms": [60000, 300000, 1800000, 3600000, 86400000],
   "force_temperature": {},
   "models": [
@@ -19,14 +21,14 @@
     {
       "key": "sk-kimi-your-key-1",
       "name": "kimi-1",
-      "weight": 1
-    },
-    {
-      "key": "sk-kimi-your-key-2",
-      "name": "kimi-2",
+      "note": "示例备注",
       "weight": 1
     }
   ],
+  "admin": {
+    "enabled": true,
+    "token": "change-me-to-a-random-string"
+  },
   "probe_check": {
     "enabled": true,
     "path": "/coding/v1/chat/completions",

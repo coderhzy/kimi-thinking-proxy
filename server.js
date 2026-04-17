@@ -21,6 +21,11 @@ const DEFAULT_CONFIG = {
   request_timeout_ms: 120000,
   disable_backoff_ms: [60000, 300000, 1800000, 3600000, 86400000],
   force_temperature: {},
+  admin: {
+    enabled: false,
+    token: ''
+  },
+  retry_on_http_error: true,
   keys: [],
   models: [
     { id: 'kimi-k2.5-thinking', name: 'Kimi K2.5 Thinking' },
@@ -77,6 +82,7 @@ function mergeConfig(base, extra) {
   const merged = Object.assign({}, base, extra || {});
   merged.feishu = Object.assign({}, base.feishu || {}, (extra || {}).feishu || {});
   merged.probe_check = Object.assign({}, base.probe_check || {}, (extra || {}).probe_check || {});
+  merged.admin = Object.assign({}, base.admin || {}, (extra || {}).admin || {});
   return merged;
 }
 
@@ -110,6 +116,10 @@ function loadConfig() {
     cfg.feishu.enabled = envBool('FEISHU_ENABLED', cfg.feishu.enabled);
     cfg.feishu.webhook = process.env.FEISHU_WEBHOOK || cfg.feishu.webhook || '';
 
+    cfg.admin = cfg.admin || {};
+    cfg.admin.enabled = envBool('ADMIN_ENABLED', cfg.admin.enabled);
+    cfg.admin.token = process.env.ADMIN_TOKEN || cfg.admin.token || '';
+
     console.log('[INFO] 配置已加载:', {
       config_path: DEFAULT_CONFIG_PATH,
       target_host: cfg.target_host,
@@ -141,6 +151,7 @@ function initKeyPool() {
       index,
       key: item.key,
       name: item.name || `key-${index + 1}`,
+      note: item.note || '',
       weight: typeof item.weight === 'number' && item.weight > 0 ? item.weight : 1,
       enabled: item.enabled !== false,
       requestCount: 0,
@@ -304,6 +315,38 @@ function markKeyError(keyObj, message, options) {
   if (duration >= 3600000) {
     sendFeishu(`[Kimi Proxy] Key ${keyObj.name} 连续失败，禁用 ${humanDur}\n原因: ${keyObj.lastError}`);
   }
+}
+
+function saveConfigToDisk() {
+  const snapshot = {
+    port: CONFIG.port,
+    host: CONFIG.host,
+    target_host: CONFIG.target_host,
+    target_path_prefix: CONFIG.target_path_prefix,
+    coding_ua: CONFIG.coding_ua,
+    auto_thinking: CONFIG.auto_thinking,
+    thinking_budget_tokens: CONFIG.thinking_budget_tokens,
+    rate_limit_rpm: CONFIG.rate_limit_rpm,
+    max_retries: CONFIG.max_retries,
+    request_timeout_ms: CONFIG.request_timeout_ms,
+    disable_backoff_ms: CONFIG.disable_backoff_ms,
+    force_temperature: CONFIG.force_temperature,
+    retry_on_http_error: CONFIG.retry_on_http_error,
+    models: CONFIG.models,
+    keys: CONFIG.keys,
+    probe_check: CONFIG.probe_check,
+    admin: CONFIG.admin,
+    feishu: CONFIG.feishu
+  };
+  fs.writeFileSync(DEFAULT_CONFIG_PATH, JSON.stringify(snapshot, null, 2));
+}
+
+function shouldRetryStatus(statusCode, body) {
+  if (!CONFIG.retry_on_http_error) return false;
+  if (statusCode === 401) return true;
+  if (statusCode >= 500) return true;
+  if (isQuotaError(statusCode, body)) return true;
+  return false;
 }
 
 function markKeyDead(keyObj, reason) {
@@ -549,6 +592,7 @@ function formatHealth() {
     keys: keyPool.map(function (k) {
       return {
         name: k.name,
+        note: k.note || '',
         enabled: k.enabled,
         weight: k.weight,
         requests: k.requestCount,
@@ -630,6 +674,28 @@ function proxyRequest(req, res, bodyStr, keyObj, retryCount) {
 
     if (isStream) {
       const isError = proxyRes.statusCode >= 400;
+      if (isError && retryCount < (CONFIG.max_retries || 2) && shouldRetryStatus(proxyRes.statusCode)) {
+        const chunks = [];
+        proxyRes.on('data', c => chunks.push(c));
+        proxyRes.on('end', function () {
+          const errBody = Buffer.concat(chunks).toString('utf-8');
+          if (isQuotaError(proxyRes.statusCode, errBody)) markKeyQuotaExhausted(keyObj);
+          else if (proxyRes.statusCode === 401) markKeyDead(keyObj, `HTTP 401: ${errBody.slice(0,200)}`);
+          else markKeyError(keyObj, `HTTP ${proxyRes.statusCode}`, { transient: true });
+          const nextKey = getNextKey(keyObj);
+          if (nextKey) {
+            console.log(`[INFO] HTTP ${proxyRes.statusCode} on ${keyObj.name}, 切换到 ${nextKey.name} 重试`);
+            stats.retriesTotal += 1;
+            proxyRequest(req, res, bodyStr, nextKey, retryCount + 1);
+          } else {
+            res.writeHead(proxyRes.statusCode, proxyRes.headers);
+            res.end(errBody);
+            stats.requestsFailed += 1;
+          }
+        });
+        return;
+      }
+
       let errorBody = '';
       res.writeHead(proxyRes.statusCode, proxyRes.headers);
       proxyRes.on('data', function (chunk) {
@@ -669,11 +735,23 @@ function proxyRequest(req, res, bodyStr, keyObj, retryCount) {
       } else {
         if (isQuotaError(proxyRes.statusCode, respBody)) {
           markKeyQuotaExhausted(keyObj);
+        } else if (proxyRes.statusCode === 401) {
+          markKeyDead(keyObj, `HTTP 401: ${respBody.slice(0, 200)}`);
         } else {
           const transient = proxyRes.statusCode === 429 || proxyRes.statusCode >= 500;
           markKeyError(keyObj, `HTTP ${proxyRes.statusCode}`, { transient });
         }
         stats.requestsFailed += 1;
+
+        if (retryCount < (CONFIG.max_retries || 2) && shouldRetryStatus(proxyRes.statusCode, respBody)) {
+          const nextKey = getNextKey(keyObj);
+          if (nextKey) {
+            console.log(`[INFO] HTTP ${proxyRes.statusCode} on ${keyObj.name}, 切换到 ${nextKey.name} 重试`);
+            stats.retriesTotal += 1;
+            proxyRequest(req, res, bodyStr, nextKey, retryCount + 1);
+            return;
+          }
+        }
       }
 
       try {
@@ -733,6 +811,359 @@ function proxyRequest(req, res, bodyStr, keyObj, retryCount) {
   proxyReq.end();
 }
 
+function maskKey(key) {
+  if (!key) return '';
+  if (key.length <= 12) return '***';
+  return key.slice(0, 12) + '***' + key.slice(-4);
+}
+
+function adminAuthOk(req) {
+  if (!CONFIG.admin || !CONFIG.admin.enabled) return false;
+  const token = CONFIG.admin.token || '';
+  if (!token) return false;
+  const auth = req.headers['authorization'] || '';
+  const match = auth.match(/^Bearer\s+(.+)$/);
+  if (!match) return false;
+  return match[1] === token;
+}
+
+function adminSendJson(res, statusCode, body) {
+  const s = JSON.stringify(body);
+  res.writeHead(statusCode, { 'Content-Type': 'application/json; charset=utf-8' });
+  res.end(s);
+}
+
+function adminListKeys() {
+  return keyPool.map(function (k, idx) {
+    const cfgKey = (CONFIG.keys || [])[idx] || {};
+    return {
+      index: idx,
+      name: k.name,
+      note: k.note || '',
+      key_masked: maskKey(k.key),
+      weight: k.weight,
+      enabled: k.enabled,
+      config_enabled: cfgKey.enabled !== false,
+      requests: k.requestCount,
+      errors: k.errorCount,
+      consecutive_errors: k.consecutiveErrors,
+      disable_tier: k.disableTier,
+      rpm_current: k.minuteRequests.length,
+      disabled_until: k.disabledUntil || null,
+      last_used: k.lastUsed || null,
+      last_error: k.lastError || null,
+      probe_status: k.probeStatus,
+      last_probe_at: k.lastProbeAt || null
+    };
+  });
+}
+
+function adminApplyChange(mutator, res) {
+  try {
+    const next = JSON.parse(JSON.stringify(CONFIG.keys || []));
+    mutator(next);
+    CONFIG.keys = next;
+    saveConfigToDisk();
+    initKeyPool();
+    adminSendJson(res, 200, { ok: true, keys: adminListKeys() });
+  } catch (error) {
+    console.log('[ERROR] admin write failed:', error.message);
+    adminSendJson(res, 500, { ok: false, error: error.message });
+  }
+}
+
+const ADMIN_HTML = `<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Kimi Proxy · Key 管理</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;padding:24px;background:#0f172a;color:#e2e8f0;font:14px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}
+h1{margin:0 0 16px;font-size:20px}
+.bar{display:flex;gap:12px;align-items:center;margin-bottom:16px;flex-wrap:wrap}
+.stat{background:#1e293b;padding:8px 14px;border-radius:8px;font-size:12px;color:#94a3b8}
+.stat b{color:#f1f5f9;font-size:16px;margin-right:4px}
+button{background:#3b82f6;color:white;border:0;padding:7px 14px;border-radius:6px;cursor:pointer;font-size:13px}
+button:hover{background:#2563eb}
+button.secondary{background:#334155}
+button.secondary:hover{background:#475569}
+button.danger{background:#dc2626}
+button.danger:hover{background:#b91c1c}
+button:disabled{opacity:.5;cursor:not-allowed}
+table{width:100%;border-collapse:collapse;background:#1e293b;border-radius:8px;overflow:hidden}
+th,td{padding:10px 12px;text-align:left;border-bottom:1px solid #334155;font-size:13px}
+th{background:#0f172a;font-weight:600;color:#94a3b8;font-size:12px;text-transform:uppercase;letter-spacing:.05em}
+tr:last-child td{border-bottom:0}
+tr:hover td{background:#1e293b}
+input,textarea{background:#0f172a;border:1px solid #334155;color:#e2e8f0;padding:6px 10px;border-radius:5px;font:inherit;width:100%}
+input:focus,textarea:focus{border-color:#3b82f6;outline:0}
+.pill{display:inline-block;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:600}
+.pill-ok{background:#064e3b;color:#6ee7b7}
+.pill-warn{background:#78350f;color:#fcd34d}
+.pill-bad{background:#7f1d1d;color:#fca5a5}
+.mono{font-family:ui-monospace,SFMono-Regular,monospace;font-size:12px;color:#94a3b8}
+.actions{display:flex;gap:6px}
+.actions button{padding:4px 10px;font-size:12px}
+dialog{background:#1e293b;color:#e2e8f0;border:1px solid #334155;border-radius:12px;padding:24px;min-width:420px;max-width:90vw}
+dialog::backdrop{background:rgba(0,0,0,.6)}
+.field{margin-bottom:12px}
+.field label{display:block;margin-bottom:4px;color:#94a3b8;font-size:12px}
+.row{display:flex;gap:8px;margin-top:16px;justify-content:flex-end}
+.error{background:#7f1d1d;color:#fca5a5;padding:8px 12px;border-radius:6px;margin-bottom:12px}
+.muted{color:#64748b;font-size:12px}
+</style>
+</head>
+<body>
+<h1>Kimi Proxy · Key 管理</h1>
+<div class="bar" id="stats"></div>
+<div class="bar">
+  <button id="addBtn">+ 添加 Key</button>
+  <button class="secondary" id="refreshBtn">刷新</button>
+  <span class="muted" id="lastUpdate"></span>
+</div>
+<div id="err"></div>
+<table>
+<thead><tr><th>#</th><th>名称</th><th>备注</th><th>Key</th><th>状态</th><th>权重</th><th>请求数</th><th>错误</th><th>最后错误</th><th>操作</th></tr></thead>
+<tbody id="rows"></tbody>
+</table>
+
+<dialog id="dlg">
+<h3 style="margin:0 0 16px">添加 / 编辑 Key</h3>
+<div id="dlgErr"></div>
+<div class="field"><label>Key</label><input id="f_key" placeholder="sk-kimi-..."></div>
+<div class="field"><label>名称</label><input id="f_name" placeholder="kimi-coding-1"></div>
+<div class="field"><label>备注</label><input id="f_note" placeholder="支付宝充值，2026-04-18"></div>
+<div class="field"><label>权重 (默认 1)</label><input id="f_weight" type="number" min="0.1" step="0.1" value="1"></div>
+<div class="row"><button class="secondary" id="dlgCancel">取消</button><button id="dlgSave">保存</button></div>
+</dialog>
+
+<script>
+const TOKEN_KEY = 'kimi-admin-token';
+let token = sessionStorage.getItem(TOKEN_KEY) || '';
+if (!token) {
+  token = prompt('请输入管理员 Token') || '';
+  if (token) sessionStorage.setItem(TOKEN_KEY, token);
+}
+
+async function api(method, path, body) {
+  const r = await fetch(path, {
+    method, headers: { 'Content-Type':'application/json', 'Authorization':'Bearer ' + token },
+    body: body ? JSON.stringify(body) : undefined
+  });
+  if (r.status === 401 || r.status === 403) {
+    sessionStorage.removeItem(TOKEN_KEY);
+    location.reload();
+    return;
+  }
+  const j = await r.json();
+  if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
+  return j;
+}
+
+function pill(k) {
+  if (!k.enabled) {
+    if (k.last_error && k.last_error.includes('401')) return '<span class="pill pill-bad">失效</span>';
+    if (k.last_error === 'quota exhausted') return '<span class="pill pill-warn">额度耗尽</span>';
+    return '<span class="pill pill-warn">已禁用</span>';
+  }
+  if (k.consecutive_errors >= 2) return '<span class="pill pill-warn">异常</span>';
+  return '<span class="pill pill-ok">正常</span>';
+}
+
+function render(data) {
+  const tbody = document.getElementById('rows');
+  tbody.innerHTML = data.keys.map(function(k) {
+    const note = (k.note || '').replace(/[<>&"]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[c]));
+    return '<tr>'
+      + '<td>' + (k.index+1) + '</td>'
+      + '<td>' + k.name + '</td>'
+      + '<td><span class="muted">' + (note || '-') + '</span></td>'
+      + '<td class="mono">' + k.key_masked + '</td>'
+      + '<td>' + pill(k) + '</td>'
+      + '<td>' + k.weight + '</td>'
+      + '<td>' + k.requests + '</td>'
+      + '<td>' + k.errors + (k.consecutive_errors ? ' <span class="muted">(连续 '+k.consecutive_errors+')</span>' : '') + '</td>'
+      + '<td class="muted" style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + (k.last_error || '-') + '</td>'
+      + '<td><div class="actions">'
+      + '<button class="secondary" onclick="edit(' + k.index + ')">编辑</button>'
+      + '<button class="' + (k.enabled ? 'secondary' : '') + '" onclick="toggle(' + k.index + ',' + (!k.enabled) + ')">' + (k.enabled ? '禁用' : '启用') + '</button>'
+      + '<button class="danger" onclick="del(' + k.index + ')">删除</button>'
+      + '</div></td></tr>';
+  }).join('');
+
+  const totalReq = data.keys.reduce((s,k)=>s+k.requests,0);
+  const totalErr = data.keys.reduce((s,k)=>s+k.errors,0);
+  const enabled = data.keys.filter(k=>k.enabled).length;
+  document.getElementById('stats').innerHTML =
+    '<div class="stat"><b>' + enabled + '/' + data.keys.length + '</b> 可用</div>'
+    + '<div class="stat"><b>' + totalReq + '</b> 总请求</div>'
+    + '<div class="stat"><b>' + totalErr + '</b> 总错误</div>';
+  document.getElementById('lastUpdate').textContent = '更新于 ' + new Date().toLocaleTimeString();
+}
+
+let cached = [];
+async function load() {
+  try {
+    const d = await api('GET', '/admin/api/keys');
+    if (d) { cached = d.keys; render(d); }
+  } catch (e) {
+    document.getElementById('err').innerHTML = '<div class="error">' + e.message + '</div>';
+  }
+}
+
+const dlg = document.getElementById('dlg');
+let editingIdx = null;
+
+document.getElementById('addBtn').onclick = () => {
+  editingIdx = null;
+  document.getElementById('f_key').value = '';
+  document.getElementById('f_name').value = '';
+  document.getElementById('f_note').value = '';
+  document.getElementById('f_weight').value = '1';
+  document.getElementById('f_key').disabled = false;
+  document.getElementById('dlgErr').innerHTML = '';
+  dlg.showModal();
+};
+document.getElementById('refreshBtn').onclick = load;
+document.getElementById('dlgCancel').onclick = () => dlg.close();
+document.getElementById('dlgSave').onclick = async () => {
+  const payload = {
+    key: document.getElementById('f_key').value.trim(),
+    name: document.getElementById('f_name').value.trim(),
+    note: document.getElementById('f_note').value.trim(),
+    weight: parseFloat(document.getElementById('f_weight').value) || 1
+  };
+  try {
+    if (editingIdx === null) {
+      await api('POST', '/admin/api/keys', payload);
+    } else {
+      delete payload.key;
+      await api('PATCH', '/admin/api/keys/' + editingIdx, payload);
+    }
+    dlg.close();
+    load();
+  } catch (e) {
+    document.getElementById('dlgErr').innerHTML = '<div class="error">' + e.message + '</div>';
+  }
+};
+
+window.edit = function(idx) {
+  editingIdx = idx;
+  const k = cached.find(x => x.index === idx);
+  document.getElementById('f_key').value = k.key_masked;
+  document.getElementById('f_key').disabled = true;
+  document.getElementById('f_name').value = k.name;
+  document.getElementById('f_note').value = k.note || '';
+  document.getElementById('f_weight').value = k.weight;
+  document.getElementById('dlgErr').innerHTML = '';
+  dlg.showModal();
+};
+window.toggle = async function(idx, enabled) {
+  try { await api('PATCH', '/admin/api/keys/' + idx, { enabled }); load(); }
+  catch(e) { document.getElementById('err').innerHTML = '<div class="error">' + e.message + '</div>'; }
+};
+window.del = async function(idx) {
+  const k = cached.find(x => x.index === idx);
+  if (!confirm('确认删除 ' + k.name + ' ?')) return;
+  try { await api('DELETE', '/admin/api/keys/' + idx); load(); }
+  catch(e) { document.getElementById('err').innerHTML = '<div class="error">' + e.message + '</div>'; }
+};
+
+load();
+setInterval(load, 10000);
+</script>
+</body>
+</html>`;
+
+function handleAdminRequest(req, res) {
+  if (!CONFIG.admin || !CONFIG.admin.enabled) {
+    res.writeHead(404);
+    res.end('admin disabled');
+    return true;
+  }
+
+  if (req.url === '/admin' || req.url === '/admin/') {
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(ADMIN_HTML);
+    return true;
+  }
+
+  if (!req.url.startsWith('/admin/api/')) return false;
+
+  if (!adminAuthOk(req)) {
+    adminSendJson(res, 401, { error: 'unauthorized' });
+    return true;
+  }
+
+  if (req.url === '/admin/api/keys' && req.method === 'GET') {
+    adminSendJson(res, 200, { keys: adminListKeys() });
+    return true;
+  }
+
+  if (req.url === '/admin/api/keys' && req.method === 'POST') {
+    let body = '';
+    req.on('data', c => body += c);
+    req.on('end', function () {
+      try {
+        const payload = JSON.parse(body || '{}');
+        if (!payload.key || typeof payload.key !== 'string') {
+          return adminSendJson(res, 400, { error: 'key 必填' });
+        }
+        adminApplyChange(function (keys) {
+          keys.push({
+            key: payload.key.trim(),
+            name: (payload.name || '').trim() || `key-${keys.length + 1}`,
+            note: (payload.note || '').trim(),
+            weight: typeof payload.weight === 'number' ? payload.weight : 1
+          });
+        }, res);
+      } catch (error) {
+        adminSendJson(res, 400, { error: error.message });
+      }
+    });
+    return true;
+  }
+
+  const match = req.url.match(/^\/admin\/api\/keys\/(\d+)$/);
+  if (match) {
+    const idx = parseInt(match[1], 10);
+
+    if (req.method === 'DELETE') {
+      adminApplyChange(function (keys) {
+        if (idx < 0 || idx >= keys.length) throw new Error('index 越界');
+        keys.splice(idx, 1);
+      }, res);
+      return true;
+    }
+
+    if (req.method === 'PATCH') {
+      let body = '';
+      req.on('data', c => body += c);
+      req.on('end', function () {
+        try {
+          const payload = JSON.parse(body || '{}');
+          adminApplyChange(function (keys) {
+            if (idx < 0 || idx >= keys.length) throw new Error('index 越界');
+            const k = keys[idx];
+            if (typeof payload.name === 'string') k.name = payload.name.trim() || k.name;
+            if (typeof payload.note === 'string') k.note = payload.note.trim();
+            if (typeof payload.weight === 'number') k.weight = payload.weight;
+            if (typeof payload.enabled === 'boolean') k.enabled = payload.enabled;
+          }, res);
+        } catch (error) {
+          adminSendJson(res, 400, { error: error.message });
+        }
+      });
+      return true;
+    }
+  }
+
+  adminSendJson(res, 404, { error: 'not found' });
+  return true;
+}
+
 const server = http.createServer(function (req, res) {
   if (req.url === '/health' || req.url === '/ready' || req.url === '/') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -750,6 +1181,10 @@ const server = http.createServer(function (req, res) {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(formatModels()));
     return;
+  }
+
+  if (req.url === '/admin' || req.url.startsWith('/admin/')) {
+    if (handleAdminRequest(req, res)) return;
   }
 
   let body = '';
