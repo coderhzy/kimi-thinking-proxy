@@ -5,7 +5,7 @@ const https = require('https');
 const fs = require('fs');
 const path = require('path');
 
-const VERSION = '0.2.0';
+const VERSION = '0.3.0';
 const DEFAULT_CONFIG_PATH = process.env.CONFIG_PATH || '/app/config.json';
 
 const DEFAULT_CONFIG = {
@@ -18,12 +18,19 @@ const DEFAULT_CONFIG = {
   rate_limit_rpm: 30,
   max_retries: 2,
   request_timeout_ms: 120000,
+  disable_backoff_ms: [60000, 300000, 1800000, 3600000, 86400000],
   keys: [],
   models: [
     { id: 'kimi-k2.5-thinking', name: 'Kimi K2.5 Thinking' },
     { id: 'kimi-for-coding', name: 'Kimi for Coding' },
     { id: 'K2.6-code-preview', name: 'Kimi K2.6 Code Preview' }
   ],
+  probe_check: {
+    enabled: false,
+    path: '/coding/v1/chat/completions',
+    model: 'kimi-for-coding',
+    interval_ms: 600000
+  },
   feishu: {
     enabled: false,
     webhook: ''
@@ -32,7 +39,7 @@ const DEFAULT_CONFIG = {
 
 let CONFIG = loadConfig();
 let keyPool = [];
-let keyIndex = 0;
+let probeCheckerTimer = null;
 const stats = {
   startTime: Date.now(),
   requestsTotal: 0,
@@ -48,6 +55,7 @@ const stats = {
 };
 
 initKeyPool();
+startProbeChecker();
 watchConfig();
 
 function envBool(name, fallback) {
@@ -66,6 +74,7 @@ function envNumber(name, fallback) {
 function mergeConfig(base, extra) {
   const merged = Object.assign({}, base, extra || {});
   merged.feishu = Object.assign({}, base.feishu || {}, (extra || {}).feishu || {});
+  merged.probe_check = Object.assign({}, base.probe_check || {}, (extra || {}).probe_check || {});
   return merged;
 }
 
@@ -120,6 +129,7 @@ function watchConfig() {
     console.log('[INFO] 配置文件变化，重新加载...');
     CONFIG = loadConfig();
     initKeyPool();
+    startProbeChecker();
   });
 }
 
@@ -129,18 +139,21 @@ function initKeyPool() {
       index,
       key: item.key,
       name: item.name || `key-${index + 1}`,
+      weight: typeof item.weight === 'number' && item.weight > 0 ? item.weight : 1,
       enabled: item.enabled !== false,
       requestCount: 0,
       errorCount: 0,
       consecutiveErrors: 0,
+      disableTier: 0,
       lastError: '',
       lastErrorTime: 0,
       lastUsed: 0,
       minuteRequests: [],
-      disabledUntil: 0
+      disabledUntil: 0,
+      probeStatus: null,
+      lastProbeAt: 0
     };
   });
-  keyIndex = 0;
   console.log('[INFO] Key 池初始化:', keyPool.length, '个 key');
 }
 
@@ -186,10 +199,9 @@ function sendFeishu(text) {
   req.end();
 }
 
-function getNextKey() {
+function getNextKey(excludeKey) {
   if (!keyPool.length) return null;
 
-  const total = keyPool.length;
   const now = Date.now();
   const rpm = CONFIG.rate_limit_rpm || 30;
   const cutoff = now - 60000;
@@ -204,36 +216,41 @@ function getNextKey() {
     item.minuteRequests = item.minuteRequests.filter(ts => ts > cutoff);
   }
 
-  for (let offset = 0; offset < total; offset++) {
-    const idx = (keyIndex + offset) % total;
-    const candidate = keyPool[idx];
+  let best = null;
+  let bestLoad = Infinity;
+  let bestLastUsed = Infinity;
+
+  for (const candidate of keyPool) {
+    if (excludeKey && candidate === excludeKey) continue;
     if (!candidate.enabled) continue;
     if (candidate.disabledUntil && candidate.disabledUntil > now) continue;
     if (candidate.minuteRequests.length >= rpm) continue;
 
-    keyIndex = (idx + 1) % total;
-    candidate.requestCount += 1;
-    candidate.lastUsed = now;
-    candidate.minuteRequests.push(now);
-    return candidate;
+    const weight = candidate.weight || 1;
+    const load = candidate.minuteRequests.length / weight;
+    if (load < bestLoad || (load === bestLoad && candidate.lastUsed < bestLastUsed)) {
+      best = candidate;
+      bestLoad = load;
+      bestLastUsed = candidate.lastUsed;
+    }
   }
 
-  return null;
+  if (!best) return null;
+  best.requestCount += 1;
+  best.lastUsed = now;
+  best.minuteRequests.push(now);
+  return best;
 }
 
 function markKeySuccess(keyObj) {
   if (!keyObj) return;
   keyObj.consecutiveErrors = 0;
+  keyObj.disableTier = 0;
   keyObj.lastError = '';
 }
 
-function isQuotaError(statusCode, body) {
-  if (statusCode === 402) return true;
-  if (statusCode === 429) {
-    const text = (body || '').toLowerCase();
-    if (/quota|balance|insufficient|exceeded|limit/.test(text)) return true;
-  }
-  return false;
+function isQuotaError(statusCode) {
+  return statusCode === 402;
 }
 
 function markKeyQuotaExhausted(keyObj) {
@@ -247,19 +264,139 @@ function markKeyQuotaExhausted(keyObj) {
   sendFeishu(`[Kimi Proxy] Key ${keyObj.name} 额度耗尽，已禁用 1 天`);
 }
 
-function markKeyError(keyObj, message) {
+function markKeyError(keyObj, message, options) {
   if (!keyObj) return;
+  const isTransient = !!(options && options.transient);
   keyObj.errorCount += 1;
-  keyObj.consecutiveErrors += 1;
   keyObj.lastError = message || 'unknown error';
   keyObj.lastErrorTime = Date.now();
 
-  if (keyObj.consecutiveErrors >= 3) {
-    keyObj.enabled = false;
-    keyObj.disabledUntil = Date.now() + 24 * 60 * 60 * 1000;
-    console.log('[WARN] Key', keyObj.name, '连续失败，禁用 1 天');
-    sendFeishu(`[Kimi Proxy] Key ${keyObj.name} 连续失败，已禁用 1 天\n原因: ${keyObj.lastError}`);
+  if (isTransient) {
+    return;
   }
+
+  keyObj.consecutiveErrors += 1;
+
+  if (keyObj.consecutiveErrors < 3) return;
+
+  const backoff = CONFIG.disable_backoff_ms || DEFAULT_CONFIG.disable_backoff_ms;
+  const tier = Math.min(keyObj.disableTier, backoff.length - 1);
+  const duration = backoff[tier];
+  keyObj.enabled = false;
+  keyObj.disabledUntil = Date.now() + duration;
+  keyObj.disableTier = Math.min(keyObj.disableTier + 1, backoff.length - 1);
+  keyObj.consecutiveErrors = 0;
+
+  const humanDur = duration >= 60000
+    ? `${Math.round(duration / 60000)} 分钟`
+    : `${Math.round(duration / 1000)} 秒`;
+  console.log('[WARN] Key', keyObj.name, `连续失败，禁用 ${humanDur} (tier ${tier})`);
+
+  if (duration >= 3600000) {
+    sendFeishu(`[Kimi Proxy] Key ${keyObj.name} 连续失败，禁用 ${humanDur}\n原因: ${keyObj.lastError}`);
+  }
+}
+
+function markKeyDead(keyObj, reason) {
+  if (!keyObj) return;
+  keyObj.enabled = false;
+  keyObj.disabledUntil = Date.now() + 365 * 24 * 60 * 60 * 1000;
+  keyObj.lastError = reason || 'key invalid';
+  keyObj.lastErrorTime = Date.now();
+  keyObj.errorCount += 1;
+  console.log('[ERROR] Key', keyObj.name, '已永久禁用:', keyObj.lastError);
+  sendFeishu(`[Kimi Proxy] Key ${keyObj.name} 失效，已永久禁用\n原因: ${keyObj.lastError}`);
+}
+
+function probeKey(keyObj) {
+  const cfg = CONFIG.probe_check || {};
+  if (!cfg.enabled || !keyObj || !keyObj.key) return;
+
+  const body = JSON.stringify({
+    model: cfg.model || 'kimi-for-coding',
+    messages: [{ role: 'user', content: 'ping' }],
+    max_tokens: 1,
+    temperature: 0.6,
+    stream: false
+  });
+
+  const options = {
+    hostname: CONFIG.target_host,
+    port: 443,
+    path: cfg.path || '/coding/v1/chat/completions',
+    method: 'POST',
+    headers: {
+      host: CONFIG.target_host,
+      authorization: `Bearer ${keyObj.key}`,
+      'user-agent': CONFIG.coding_ua || DEFAULT_CONFIG.coding_ua,
+      'content-type': 'application/json',
+      'content-length': Buffer.byteLength(body),
+      accept: 'application/json'
+    },
+    timeout: 15000
+  };
+
+  const req = https.request(options, function (res) {
+    const chunks = [];
+    res.on('data', chunk => chunks.push(chunk));
+    res.on('end', function () {
+      keyObj.lastProbeAt = Date.now();
+      const text = Buffer.concat(chunks).toString('utf-8').slice(0, 300);
+
+      if (res.statusCode === 402) {
+        keyObj.probeStatus = 'quota_exhausted';
+        if (keyObj.enabled) {
+          console.log(`[WARN] Key ${keyObj.name} 探活 402，额度耗尽`);
+          markKeyQuotaExhausted(keyObj);
+        }
+      } else if (res.statusCode === 401 || res.statusCode === 403) {
+        keyObj.probeStatus = 'invalid';
+        if (keyObj.enabled) {
+          markKeyDead(keyObj, `HTTP ${res.statusCode}: ${text}`);
+        }
+      } else if (res.statusCode >= 200 && res.statusCode < 300) {
+        keyObj.probeStatus = 'healthy';
+      } else {
+        keyObj.probeStatus = `http_${res.statusCode}`;
+      }
+    });
+  });
+
+  req.on('error', function (error) {
+    keyObj.probeStatus = 'network_error';
+    keyObj.lastProbeAt = Date.now();
+    console.log(`[WARN] 探活网络错误 ${keyObj.name}: ${error.message}`);
+  });
+  req.on('timeout', function () {
+    req.destroy(new Error('probe timeout'));
+  });
+  req.write(body);
+  req.end();
+}
+
+function startProbeChecker() {
+  if (probeCheckerTimer) {
+    clearInterval(probeCheckerTimer);
+    probeCheckerTimer = null;
+  }
+  const cfg = CONFIG.probe_check || {};
+  if (!cfg.enabled) {
+    console.log('[INFO] 探活检测未启用');
+    return;
+  }
+  const interval = cfg.interval_ms || 600000;
+  probeCheckerTimer = setInterval(function () {
+    keyPool.forEach(function (key) {
+      if (!key.enabled) return;
+      probeKey(key);
+    });
+  }, interval);
+  console.log(`[INFO] 探活检测已启动: model=${cfg.model || 'kimi-for-coding'}, 间隔=${Math.round(interval / 1000)}s`);
+  setTimeout(function () {
+    keyPool.forEach(function (key) {
+      if (key.enabled) probeKey(key);
+    });
+  }, 5000);
 }
 
 function cleanJsonResponse(content) {
@@ -394,13 +531,17 @@ function formatHealth() {
       return {
         name: k.name,
         enabled: k.enabled,
+        weight: k.weight,
         requests: k.requestCount,
         errors: k.errorCount,
         consecutive_errors: k.consecutiveErrors,
+        disable_tier: k.disableTier,
         rpm_current: k.minuteRequests.length,
         disabled_until: k.disabledUntil || null,
         last_used: k.lastUsed || null,
-        last_error: k.lastError || null
+        last_error: k.lastError || null,
+        probe_status: k.probeStatus,
+        last_probe_at: k.lastProbeAt || null
       };
     })
   };
@@ -482,10 +623,11 @@ function proxyRequest(req, res, bodyStr, keyObj, retryCount) {
           markKeySuccess(keyObj);
           stats.requestsSucceeded += 1;
         } else {
-          if (isQuotaError(proxyRes.statusCode, '')) {
+          if (isQuotaError(proxyRes.statusCode)) {
             markKeyQuotaExhausted(keyObj);
           } else {
-            markKeyError(keyObj, `HTTP ${proxyRes.statusCode}`);
+            const transient = proxyRes.statusCode === 429 || proxyRes.statusCode >= 500;
+            markKeyError(keyObj, `HTTP ${proxyRes.statusCode}`, { transient });
           }
           stats.requestsFailed += 1;
         }
@@ -503,10 +645,11 @@ function proxyRequest(req, res, bodyStr, keyObj, retryCount) {
         markKeySuccess(keyObj);
         stats.requestsSucceeded += 1;
       } else {
-        if (isQuotaError(proxyRes.statusCode, respBody)) {
+        if (isQuotaError(proxyRes.statusCode)) {
           markKeyQuotaExhausted(keyObj);
         } else {
-          markKeyError(keyObj, `HTTP ${proxyRes.statusCode}`);
+          const transient = proxyRes.statusCode === 429 || proxyRes.statusCode >= 500;
+          markKeyError(keyObj, `HTTP ${proxyRes.statusCode}`, { transient });
         }
         stats.requestsFailed += 1;
       }
@@ -548,10 +691,10 @@ function proxyRequest(req, res, bodyStr, keyObj, retryCount) {
   proxyReq.on('error', function (error) {
     console.log('[ERROR] Key', keyObj.name, '网络错误:', error.message);
     stats.upstreamNetworkErrors += 1;
-    markKeyError(keyObj, error.message);
+    markKeyError(keyObj, error.message, { transient: true });
 
     if (retryCount < (CONFIG.max_retries || 2)) {
-      const nextKey = getNextKey();
+      const nextKey = getNextKey(keyObj);
       if (nextKey) {
         stats.retriesTotal += 1;
         proxyRequest(req, res, bodyStr, nextKey, retryCount + 1);

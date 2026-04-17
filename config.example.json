@@ -8,6 +8,7 @@
   "rate_limit_rpm": 30,
   "max_retries": 2,
   "request_timeout_ms": 120000,
+  "disable_backoff_ms": [60000, 300000, 1800000, 3600000, 86400000],
   "models": [
     { "id": "kimi-k2.5-thinking", "name": "Kimi K2.5 Thinking" },
     { "id": "kimi-for-coding", "name": "Kimi for Coding" },
@@ -16,16 +17,23 @@
   "keys": [
     {
       "key": "sk-kimi-your-key-1",
-      "name": "kimi-1"
+      "name": "kimi-1",
+      "weight": 1
     },
     {
       "key": "sk-kimi-your-key-2",
-      "name": "kimi-2"
+      "name": "kimi-2",
+      "weight": 1
     }
   ],
-  "telegram": {
+  "probe_check": {
+    "enabled": true,
+    "path": "/coding/v1/chat/completions",
+    "model": "kimi-for-coding",
+    "interval_ms": 600000
+  },
+  "feishu": {
     "enabled": false,
-    "bot_token": "",
-    "chat_id": ""
+    "webhook": ""
   }
 }
