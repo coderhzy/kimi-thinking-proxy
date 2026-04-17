@@ -437,12 +437,16 @@ function probeKey(keyObj) {
         if (keyObj.enabled) markKeyDead(keyObj, `HTTP 403: ${text}`);
       } else if (res.statusCode >= 200 && res.statusCode < 300) {
         keyObj.probeStatus = 'healthy';
-        if (!keyObj.enabled && keyObj.disabledUntil && keyObj.disabledUntil > Date.now()) {
-          console.log(`[INFO] Key ${keyObj.name} 探活成功，提前恢复`);
+        const cfgKey = (CONFIG.keys || [])[keyObj.index];
+        const configEnabled = !cfgKey || cfgKey.enabled !== false;
+        if (!keyObj.enabled && configEnabled) {
+          const prevReason = keyObj.lastError || 'unknown';
+          console.log(`[INFO] Key ${keyObj.name} 探活成功，从 "${prevReason}" 恢复可用`);
           keyObj.enabled = true;
           keyObj.disabledUntil = 0;
           keyObj.consecutiveErrors = 0;
           keyObj.disableTier = 0;
+          keyObj.lastError = '';
         }
       } else {
         keyObj.probeStatus = `http_${res.statusCode}`;
@@ -474,17 +478,11 @@ function startProbeChecker() {
   }
   const interval = cfg.interval_ms || 600000;
   probeCheckerTimer = setInterval(function () {
-    keyPool.forEach(function (key) {
-      if (key.probeStatus === 'invalid' || key.probeStatus === 'forbidden') return;
-      probeKey(key);
-    });
+    keyPool.forEach(probeKey);
   }, interval);
   console.log(`[INFO] 探活检测已启动: model=${cfg.model || 'kimi-for-coding'}, 间隔=${Math.round(interval / 1000)}s`);
   setTimeout(function () {
-    keyPool.forEach(function (key) {
-      if (key.probeStatus === 'invalid' || key.probeStatus === 'forbidden') return;
-      probeKey(key);
-    });
+    keyPool.forEach(probeKey);
   }, 5000);
 }
 
@@ -1236,7 +1234,6 @@ function handleAdminRequest(req, res) {
   if (req.url === '/admin/api/probe' && req.method === 'POST') {
     let triggered = 0;
     keyPool.forEach(function (key) {
-      if (key.probeStatus === 'invalid' || key.probeStatus === 'forbidden') return;
       probeKey(key);
       triggered += 1;
     });
