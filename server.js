@@ -364,13 +364,20 @@ function probeKey(keyObj) {
   const cfg = CONFIG.probe_check || {};
   if (!keyObj || !keyObj.key) return;
 
-  const body = JSON.stringify({
+  const probeBody = {
     model: cfg.model || 'kimi-for-coding',
     messages: [{ role: 'user', content: 'ping' }],
     max_tokens: 1,
     temperature: 0.6,
     stream: false
-  });
+  };
+  if (CONFIG.auto_thinking) {
+    probeBody.thinking = {
+      type: 'enabled',
+      budget_tokens: CONFIG.thinking_budget_tokens || 512
+    };
+  }
+  const body = JSON.stringify(probeBody);
 
   const options = {
     hostname: CONFIG.target_host,
