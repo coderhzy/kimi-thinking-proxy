@@ -146,14 +146,34 @@ function watchConfig() {
 }
 
 function initKeyPool() {
+  const oldByKey = Object.create(null);
+  keyPool.forEach(function (k) { oldByKey[k.key] = k; });
+
   keyPool = (CONFIG.keys || []).map(function (item, index) {
+    const old = oldByKey[item.key];
+    const configEnabled = item.enabled !== false;
+    const weight = typeof item.weight === 'number' && item.weight > 0 ? item.weight : 1;
+
+    if (old) {
+      old.index = index;
+      old.name = item.name || old.name;
+      old.note = item.note || '';
+      old.weight = weight;
+      if (!configEnabled) {
+        old.enabled = false;
+      } else if (old.enabled === false && !old.disabledUntil) {
+        old.enabled = true;
+      }
+      return old;
+    }
+
     return {
       index,
       key: item.key,
       name: item.name || `key-${index + 1}`,
       note: item.note || '',
-      weight: typeof item.weight === 'number' && item.weight > 0 ? item.weight : 1,
-      enabled: item.enabled !== false,
+      weight,
+      enabled: configEnabled,
       requestCount: 0,
       errorCount: 0,
       consecutiveErrors: 0,
@@ -167,7 +187,7 @@ function initKeyPool() {
       lastProbeAt: 0
     };
   });
-  console.log('[INFO] Key 池初始化:', keyPool.length, '个 key');
+  console.log('[INFO] Key 池初始化:', keyPool.length, '个 key（保留 ' + Object.keys(oldByKey).filter(k => keyPool.find(p => p.key === k)).length + ' 个已有状态）');
 }
 
 function nowIso() {
@@ -1267,6 +1287,7 @@ function handleAdminRequest(req, res) {
       req.on('end', function () {
         try {
           const payload = JSON.parse(body || '{}');
+          const forceEnable = payload.enabled === true;
           adminApplyChange(function (keys) {
             if (idx < 0 || idx >= keys.length) throw new Error('index 越界');
             const k = keys[idx];
@@ -1275,6 +1296,17 @@ function handleAdminRequest(req, res) {
             if (typeof payload.weight === 'number') k.weight = payload.weight;
             if (typeof payload.enabled === 'boolean') k.enabled = payload.enabled;
           }, res);
+          if (forceEnable) {
+            const pooled = keyPool[idx];
+            if (pooled) {
+              pooled.enabled = true;
+              pooled.disabledUntil = 0;
+              pooled.consecutiveErrors = 0;
+              pooled.disableTier = 0;
+              pooled.probeStatus = null;
+              console.log(`[INFO] 管理端手动启用 ${pooled.name}，清空运行时禁用状态`);
+            }
+          }
         } catch (error) {
           adminSendJson(res, 400, { error: error.message });
         }
