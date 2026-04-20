@@ -29,6 +29,7 @@ const DEFAULT_CONFIG = {
   keys: [],
   models: [
     { id: 'kimi-k2.5-thinking', name: 'Kimi K2.5 Thinking' },
+    { id: 'kimi-k2.5', name: 'Kimi K2.5', thinking: false },
     { id: 'kimi-for-coding', name: 'Kimi for Coding' },
     { id: 'K2.6-code-preview', name: 'Kimi K2.6 Code Preview' }
   ],
@@ -391,7 +392,7 @@ function probeKey(keyObj) {
     temperature: 0.6,
     stream: false
   };
-  if (CONFIG.auto_thinking) {
+  if (shouldInjectThinking(probeBody.model)) {
     probeBody.thinking = {
       type: 'enabled',
       budget_tokens: CONFIG.thinking_budget_tokens || 512
@@ -601,6 +602,14 @@ function formatModels() {
       };
     })
   };
+}
+
+function shouldInjectThinking(modelId) {
+  if (!CONFIG.auto_thinking) return false;
+  const models = CONFIG.models || DEFAULT_CONFIG.models || [];
+  const entry = models.find(function (m) { return m.id === modelId; });
+  if (entry && entry.thinking === false) return false;
+  return true;
 }
 
 function formatHealth() {
@@ -1358,7 +1367,7 @@ const server = http.createServer(function (req, res) {
     try {
       const json = JSON.parse(body || '{}');
 
-      if (CONFIG.auto_thinking && !json.thinking) {
+      if (!json.thinking && shouldInjectThinking(json.model)) {
         json.thinking = {
           type: 'enabled',
           budget_tokens: CONFIG.thinking_budget_tokens || 512
