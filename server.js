@@ -84,7 +84,20 @@ function mergeConfig(base, extra) {
   merged.feishu = Object.assign({}, base.feishu || {}, (extra || {}).feishu || {});
   merged.probe_check = Object.assign({}, base.probe_check || {}, (extra || {}).probe_check || {});
   merged.admin = Object.assign({}, base.admin || {}, (extra || {}).admin || {});
+  merged.models = mergeModels(base.models, (extra || {}).models);
   return merged;
+}
+
+function mergeModels(baseModels, extraModels) {
+  const baseList = Array.isArray(baseModels) ? baseModels : [];
+  if (!Array.isArray(extraModels)) return baseList.slice();
+  const extraById = new Map(extraModels.filter(m => m && m.id).map(m => [m.id, m]));
+  const result = baseList.map(m => (extraById.has(m.id) ? Object.assign({}, m, extraById.get(m.id)) : m));
+  const baseIds = new Set(baseList.map(m => m.id));
+  for (const m of extraModels) {
+    if (m && m.id && !baseIds.has(m.id)) result.push(m);
+  }
+  return result;
 }
 
 function loadConfig() {
