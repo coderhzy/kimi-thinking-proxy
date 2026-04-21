@@ -16,7 +16,7 @@
     { "id": "kimi-k2.5-thinking", "name": "Kimi K2.5 Thinking" },
     { "id": "kimi-k2.5", "name": "Kimi K2.5", "thinking": false },
     { "id": "kimi-for-coding", "name": "Kimi for Coding" },
-    { "id": "K2.6-code-preview", "name": "Kimi K2.6 Code Preview" }
+    { "id": "K2.6", "name": "K2.6" }
   ],
   "keys": [
     {
