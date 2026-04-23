@@ -1434,7 +1434,7 @@ window.testKey = async function(idx) {
     const r = await api('POST', '/admin/api/keys/' + idx + '/chat-test');
     const summary = (r.ok ? '✓ ' : '✗ ') + 'HTTP ' + r.status + ' · ' + r.latency_ms + 'ms'
       + (r.upstream_model ? ' · ' + r.upstream_model : '')
-      + (r.error ? '\n' + r.error : '\n' + (r.reply || '(no content)').slice(0, 160));
+      + (r.error ? '\\n' + r.error : '\\n' + (r.reply || '(no content)').slice(0, 160));
     tEls.forEach(el => { el.className = 'testresult ' + (r.ok ? 'ok' : 'fail'); el.textContent = summary; });
   } catch (e) {
     tEls.forEach(el => { el.className = 'testresult fail'; el.textContent = '✗ ' + e.message; });
