@@ -1735,9 +1735,13 @@ function handleProxiedRequest(req, res, body, keyObj) {
     try {
       const json = JSON.parse(body || '{}');
 
-      if (!json.thinking) {
-        const t = thinkingPayloadFor(json.model);
-        if (t) json.thinking = t;
+      const t = thinkingPayloadFor(json.model);
+      if (t) {
+        if (t.type === 'disabled') {
+          json.thinking = t;
+        } else if (!json.thinking) {
+          json.thinking = t;
+        }
       }
       if (json.enable_thinking !== undefined) {
         delete json.enable_thinking;
