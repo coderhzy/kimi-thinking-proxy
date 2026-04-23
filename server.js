@@ -31,7 +31,8 @@ const DEFAULT_CONFIG = {
     { id: 'kimi-k2.5-thinking', name: 'Kimi K2.5 Thinking' },
     { id: 'kimi-k2.5', name: 'Kimi K2.5', thinking: false },
     { id: 'kimi-for-coding', name: 'Kimi for Coding' },
-    { id: 'K2.6', name: 'K2.6' }
+    { id: 'k2.6-thinking', name: 'k2.6 Thinking' },
+    { id: 'k2.6', name: 'k2.6', thinking: false }
   ],
   probe_check: {
     enabled: false,
