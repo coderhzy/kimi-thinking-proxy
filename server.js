@@ -405,12 +405,8 @@ function probeKey(keyObj) {
     temperature: 0.6,
     stream: false
   };
-  if (shouldInjectThinking(probeBody.model)) {
-    probeBody.thinking = {
-      type: 'enabled',
-      budget_tokens: CONFIG.thinking_budget_tokens || 512
-    };
-  }
+  const probeThinking = thinkingPayloadFor(probeBody.model);
+  if (probeThinking) probeBody.thinking = probeThinking;
   const body = JSON.stringify(probeBody);
 
   const options = {
@@ -567,7 +563,7 @@ function processImageUrls(messages, callback) {
   });
 }
 
-function normalizeStreamChunk(chunk, stripReasoning) {
+function normalizeStreamChunk(chunk) {
   const text = chunk.toString('utf-8');
   const lines = text.split('\n');
   const out = [];
@@ -588,10 +584,7 @@ function normalizeStreamChunk(chunk, stripReasoning) {
       const json = JSON.parse(payload);
       const choices = Array.isArray(json.choices) ? json.choices : [];
       for (const choice of choices) {
-        if (!choice.delta) continue;
-        if (stripReasoning) {
-          if (choice.delta.reasoning_content !== undefined) delete choice.delta.reasoning_content;
-        } else if (choice.delta.reasoning_content) {
+        if (choice.delta && choice.delta.reasoning_content) {
           choice.delta.content = `<think>\n${choice.delta.reasoning_content}\n</think>\n\n` + (choice.delta.content || '');
           delete choice.delta.reasoning_content;
         }
@@ -620,18 +613,16 @@ function formatModels() {
   };
 }
 
-function shouldInjectThinking(modelId) {
-  if (!CONFIG.auto_thinking) return false;
+function thinkingPayloadFor(modelId) {
   const models = CONFIG.models || DEFAULT_CONFIG.models || [];
   const entry = models.find(function (m) { return m.id === modelId; });
-  if (entry && entry.thinking === false) return false;
-  return true;
-}
-
-function shouldStripReasoning(modelId) {
-  const models = CONFIG.models || DEFAULT_CONFIG.models || [];
-  const entry = models.find(function (m) { return m.id === modelId; });
-  return !!(entry && entry.thinking === false);
+  if (entry && entry.thinking === false) {
+    return { type: 'disabled' };
+  }
+  if (CONFIG.auto_thinking) {
+    return { type: 'enabled', budget_tokens: CONFIG.thinking_budget_tokens || 512 };
+  }
+  return null;
 }
 
 function formatHealth() {
@@ -705,9 +696,6 @@ function formatMetrics() {
 
 function proxyRequest(req, res, bodyStr, keyObj, retryCount) {
   const upstreamPath = `${CONFIG.target_path_prefix || ''}${req.url}`;
-  let reqModelId = '';
-  try { reqModelId = (JSON.parse(bodyStr) || {}).model || ''; } catch (_) {}
-  const stripReasoning = shouldStripReasoning(reqModelId);
   const headers = Object.assign({}, req.headers, {
     host: CONFIG.target_host,
     authorization: `Bearer ${keyObj.key}`,
@@ -760,7 +748,7 @@ function proxyRequest(req, res, bodyStr, keyObj, retryCount) {
       proxyRes.on('data', function (chunk) {
         if (isError) errorBody += chunk.toString('utf-8');
         try {
-          res.write(normalizeStreamChunk(chunk, stripReasoning));
+          res.write(normalizeStreamChunk(chunk));
         } catch (_) {
           res.write(chunk);
         }
@@ -820,9 +808,7 @@ function proxyRequest(req, res, bodyStr, keyObj, retryCount) {
           data.choices.forEach(function (choice) {
             const msg = choice.message;
             if (!msg) return;
-            if (stripReasoning) {
-              if (msg.reasoning_content !== undefined) delete msg.reasoning_content;
-            } else if (msg.reasoning_content) {
+            if (msg.reasoning_content) {
               msg.content = `<think>\n${msg.reasoning_content}\n</think>\n\n${msg.content || ''}`;
               delete msg.reasoning_content;
             }
@@ -1394,11 +1380,9 @@ const server = http.createServer(function (req, res) {
     try {
       const json = JSON.parse(body || '{}');
 
-      if (!json.thinking && shouldInjectThinking(json.model)) {
-        json.thinking = {
-          type: 'enabled',
-          budget_tokens: CONFIG.thinking_budget_tokens || 512
-        };
+      if (!json.thinking) {
+        const t = thinkingPayloadFor(json.model);
+        if (t) json.thinking = t;
       }
       if (json.enable_thinking !== undefined) {
         delete json.enable_thinking;
