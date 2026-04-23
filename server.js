@@ -29,11 +29,8 @@ const DEFAULT_CONFIG = {
   retry_on_http_error: true,
   keys: [],
   models: [
-    { id: 'kimi-k2.5-thinking', name: 'Kimi K2.5 Thinking' },
-    { id: 'kimi-k2.5', name: 'Kimi K2.5', thinking: false },
-    { id: 'kimi-for-coding', name: 'Kimi for Coding' },
-    { id: 'k2.6-thinking', name: 'k2.6 Thinking' },
-    { id: 'k2.6', name: 'k2.6', thinking: false }
+    { id: 'kimi-thinking', name: 'Kimi Thinking' },
+    { id: 'kimi', name: 'Kimi', thinking: false }
   ],
   probe_check: {
     enabled: false,

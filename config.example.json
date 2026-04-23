@@ -10,14 +10,13 @@
   "max_retries": 2,
   "request_timeout_ms": 120000,
   "retry_on_http_error": true,
-  "disable_backoff_ms": [60000, 300000, 1800000, 3600000, 86400000],
+  "disable_backoff_ms": [60000, 300000, 900000, 1800000, 3600000],
+  "quota_disable_ms": 3600000,
+  "rpm_wait_max_ms": 5000,
   "force_temperature": {},
   "models": [
-    { "id": "kimi-k2.5-thinking", "name": "Kimi K2.5 Thinking" },
-    { "id": "kimi-k2.5", "name": "Kimi K2.5", "thinking": false },
-    { "id": "kimi-for-coding", "name": "Kimi for Coding" },
-    { "id": "k2.6-thinking", "name": "k2.6 Thinking" },
-    { "id": "k2.6", "name": "k2.6", "thinking": false }
+    { "id": "kimi-thinking", "name": "Kimi Thinking" },
+    { "id": "kimi", "name": "Kimi", "thinking": false }
   ],
   "keys": [
     {
