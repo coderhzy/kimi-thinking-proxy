@@ -17,9 +17,10 @@ const DEFAULT_CONFIG = {
   auto_thinking: true,
   thinking_budget_tokens: 512,
   rate_limit_rpm: 30,
+  rpm_wait_max_ms: 5000,
   max_retries: 2,
   request_timeout_ms: 120000,
-  disable_backoff_ms: [60000, 300000, 1800000, 3600000, 86400000],
+  disable_backoff_ms: [60000, 300000, 900000, 1800000, 3600000],
   force_temperature: {},
   admin: {
     enabled: false,
@@ -60,6 +61,8 @@ const stats = {
   upstreamHttpErrors: 0,
   parseFallbacks: 0,
   lastRequestAt: 0,
+  rpmWaitedRequests: 0,
+  rpmWaitTotalMs: 0,
   perRoute: Object.create(null)
 };
 
@@ -199,7 +202,8 @@ function initKeyPool() {
       minuteRequests: [],
       disabledUntil: 0,
       probeStatus: null,
-      lastProbeAt: 0
+      lastProbeAt: 0,
+      historyBuckets: Array.from({ length: 30 }, () => ({ minute: 0, requests: 0, errors: 0 }))
     };
   });
   console.log('[INFO] Key 池初始化:', keyPool.length, '个 key（保留 ' + Object.keys(oldByKey).filter(k => keyPool.find(p => p.key === k)).length + ' 个已有状态）');
@@ -287,7 +291,56 @@ function getNextKey(excludeKey) {
   best.requestCount += 1;
   best.lastUsed = now;
   best.minuteRequests.push(now);
+  bumpHistory(best, 'requests');
   return best;
+}
+
+function bumpHistory(k, kind) {
+  if (!k || !k.historyBuckets) return;
+  const minute = Math.floor(Date.now() / 60000);
+  const slot = k.historyBuckets[minute % 30];
+  if (slot.minute !== minute) { slot.minute = minute; slot.requests = 0; slot.errors = 0; }
+  slot[kind] = (slot[kind] || 0) + 1;
+}
+
+function readHistory(k) {
+  const now = Math.floor(Date.now() / 60000);
+  const out = [];
+  for (let i = 29; i >= 0; i--) {
+    const target = now - i;
+    const slot = k.historyBuckets ? k.historyBuckets[target % 30] : null;
+    out.push(slot && slot.minute === target
+      ? { requests: slot.requests, errors: slot.errors }
+      : { requests: 0, errors: 0 });
+  }
+  return out;
+}
+
+function hasAnyEnabledKey() {
+  const now = Date.now();
+  return keyPool.some(function (k) {
+    return k.enabled && (!k.disabledUntil || k.disabledUntil <= now);
+  });
+}
+
+function getNextKeyOrWait(callback) {
+  const start = Date.now();
+  const maxWait = (CONFIG.rpm_wait_max_ms != null) ? CONFIG.rpm_wait_max_ms : 5000;
+  const tick = function () {
+    const k = getNextKey();
+    if (k) {
+      const waited = Date.now() - start;
+      if (waited > 0) {
+        stats.rpmWaitedRequests += 1;
+        stats.rpmWaitTotalMs += waited;
+      }
+      return callback(k, waited);
+    }
+    if (!hasAnyEnabledKey()) return callback(null, Date.now() - start);
+    if (Date.now() - start >= maxWait) return callback(null, Date.now() - start);
+    setTimeout(tick, 200);
+  };
+  tick();
 }
 
 function markKeySuccess(keyObj) {
@@ -310,13 +363,16 @@ function isQuotaError(statusCode, body) {
 
 function markKeyQuotaExhausted(keyObj) {
   if (!keyObj) return;
+  const banMs = (CONFIG.quota_disable_ms != null) ? CONFIG.quota_disable_ms : 60 * 60 * 1000;
   keyObj.enabled = false;
-  keyObj.disabledUntil = Date.now() + 24 * 60 * 60 * 1000;
+  keyObj.disabledUntil = Date.now() + banMs;
   keyObj.lastError = 'quota exhausted';
   keyObj.lastErrorTime = Date.now();
   keyObj.errorCount += 1;
-  console.log('[WARN] Key', keyObj.name, '额度耗尽，禁用 1 天');
-  sendFeishu(`[Kimi Proxy] Key ${keyObj.name} 额度耗尽，已禁用 1 天`);
+  bumpHistory(keyObj, 'errors');
+  const humanDur = banMs >= 60000 ? `${Math.round(banMs / 60000)} 分钟` : `${Math.round(banMs / 1000)} 秒`;
+  console.log('[WARN] Key', keyObj.name, `额度耗尽，禁用 ${humanDur}（探活成功会自动恢复）`);
+  sendFeishu(`[Kimi Proxy] Key ${keyObj.name} 额度耗尽，已禁用 ${humanDur}`);
 }
 
 function markKeyError(keyObj, message, options) {
@@ -325,6 +381,7 @@ function markKeyError(keyObj, message, options) {
   keyObj.errorCount += 1;
   keyObj.lastError = message || 'unknown error';
   keyObj.lastErrorTime = Date.now();
+  bumpHistory(keyObj, 'errors');
 
   if (isTransient) {
     return;
@@ -362,9 +419,11 @@ function saveConfigToDisk() {
     auto_thinking: CONFIG.auto_thinking,
     thinking_budget_tokens: CONFIG.thinking_budget_tokens,
     rate_limit_rpm: CONFIG.rate_limit_rpm,
+    rpm_wait_max_ms: CONFIG.rpm_wait_max_ms,
     max_retries: CONFIG.max_retries,
     request_timeout_ms: CONFIG.request_timeout_ms,
     disable_backoff_ms: CONFIG.disable_backoff_ms,
+    quota_disable_ms: CONFIG.quota_disable_ms,
     force_temperature: CONFIG.force_temperature,
     retry_on_http_error: CONFIG.retry_on_http_error,
     models: CONFIG.models,
@@ -391,8 +450,67 @@ function markKeyDead(keyObj, reason) {
   keyObj.lastError = reason || 'key invalid';
   keyObj.lastErrorTime = Date.now();
   keyObj.errorCount += 1;
+  bumpHistory(keyObj, 'errors');
   console.log('[ERROR] Key', keyObj.name, '已永久禁用:', keyObj.lastError);
   sendFeishu(`[Kimi Proxy] Key ${keyObj.name} 失效，已永久禁用\n原因: ${keyObj.lastError}`);
+}
+
+function runChatTest(keyObj, callback) {
+  const cfg = CONFIG.probe_check || {};
+  const probeModel = cfg.model || 'kimi-for-coding';
+  const reqBody = {
+    model: probeModel,
+    messages: [{ role: 'user', content: '回答: 1+1 等于几?' }],
+    max_tokens: 32,
+    temperature: 0.6,
+    stream: false
+  };
+  const t = thinkingPayloadFor(probeModel);
+  if (t) reqBody.thinking = t;
+  const body = JSON.stringify(reqBody);
+  const start = Date.now();
+
+  const req = https.request({
+    hostname: CONFIG.target_host,
+    port: 443,
+    path: cfg.path || '/coding/v1/chat/completions',
+    method: 'POST',
+    timeout: 30000,
+    headers: {
+      host: CONFIG.target_host,
+      authorization: `Bearer ${keyObj.key}`,
+      'user-agent': CONFIG.coding_ua || DEFAULT_CONFIG.coding_ua,
+      'content-type': 'application/json',
+      'content-length': Buffer.byteLength(body),
+      accept: 'application/json'
+    }
+  }, function (res) {
+    const chunks = [];
+    res.on('data', c => chunks.push(c));
+    res.on('end', function () {
+      const ms = Date.now() - start;
+      const raw = Buffer.concat(chunks).toString('utf-8');
+      let parsed = null;
+      try { parsed = JSON.parse(raw); } catch (_) {}
+      const msg = parsed && parsed.choices && parsed.choices[0] && parsed.choices[0].message;
+      const reply = msg ? (msg.content || msg.reasoning_content || '') : '';
+      callback({
+        ok: res.statusCode >= 200 && res.statusCode < 300,
+        status: res.statusCode,
+        latency_ms: ms,
+        upstream_model: parsed && parsed.model,
+        reply: reply.slice(0, 200),
+        error: parsed && parsed.error ? parsed.error.message : null,
+        raw_preview: raw.slice(0, 400)
+      });
+    });
+  });
+  req.on('error', function (err) {
+    callback({ ok: false, status: 0, latency_ms: Date.now() - start, error: 'network: ' + err.message });
+  });
+  req.on('timeout', function () { req.destroy(new Error('timeout')); });
+  req.write(body);
+  req.end();
 }
 
 function probeKey(keyObj) {
@@ -928,7 +1046,8 @@ function adminListKeys() {
       last_used: k.lastUsed || null,
       last_error: k.lastError || null,
       probe_status: k.probeStatus,
-      last_probe_at: k.lastProbeAt || null
+      last_probe_at: k.lastProbeAt || null,
+      history: readHistory(k)
     };
   });
 }
@@ -995,7 +1114,29 @@ dialog::backdrop{background:rgba(0,0,0,.6)}
 .field label{display:block;margin-bottom:4px;color:#94a3b8;font-size:12px}
 .row{display:flex;gap:8px;margin-top:16px;justify-content:flex-end}
 .error{background:#7f1d1d;color:#fca5a5;padding:8px 12px;border-radius:6px;margin-bottom:12px}
+.success{background:#064e3b;color:#6ee7b7;padding:8px 12px;border-radius:6px;margin-bottom:12px;font-size:12px}
 .muted{color:#64748b;font-size:12px}
+.spark{display:block}
+.spark .req{stroke:#3b82f6;stroke-width:1.5;fill:none}
+.spark .err{stroke:#ef4444;stroke-width:1.5;fill:none}
+.spark .grid{stroke:#1e293b;stroke-width:1}
+.testresult{font-size:11px;color:#94a3b8;margin-top:4px;max-width:240px;line-height:1.3;white-space:pre-wrap;word-break:break-all}
+.testresult.ok{color:#6ee7b7}
+.testresult.fail{color:#fca5a5}
+@media (max-width:760px) {
+  body{padding:14px}
+  table{display:none}
+  .card{background:#1e293b;border-radius:10px;padding:14px;margin-bottom:10px;display:block}
+  .card .row1{display:flex;justify-content:space-between;align-items:flex-start;gap:8px}
+  .card .name{font-weight:600;font-size:14px;color:#f1f5f9}
+  .card .meta{font-size:11px;color:#94a3b8;margin-top:4px}
+  .card .body{margin-top:10px;display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:12px}
+  .card .body div b{color:#f1f5f9;display:block;font-size:14px}
+  .card .actions{margin-top:12px;flex-wrap:wrap}
+  .card .actions button{flex:1;min-width:80px}
+  dialog{min-width:auto;width:calc(100vw - 28px)}
+}
+@media (min-width:761px) { .cards{display:none} }
 </style>
 </head>
 <body>
@@ -1005,14 +1146,18 @@ dialog::backdrop{background:rgba(0,0,0,.6)}
   <button id="addBtn">+ 添加 Key</button>
   <button class="secondary" id="refreshBtn">刷新</button>
   <button class="secondary" id="probeBtn" title="向所有 key 发一条极小探测请求，确认真实状态">🔬 立即检测</button>
+  <button class="secondary" id="recoverAllBtn" title="清空所有 key 的暂禁/退避状态，强制立即可用">🩹 一键恢复</button>
+  <button class="secondary" id="settingsBtn" title="编辑运行时配置（thinking、限流、退避等）">⚙️ 设置</button>
   <span class="muted" id="lastUpdate"></span>
   <span class="muted" id="nextProbe"></span>
 </div>
 <div id="err"></div>
+<div id="msg"></div>
 <table>
-<thead><tr><th>#</th><th>名称</th><th>备注</th><th>Key</th><th>状态</th><th>权重</th><th>请求数</th><th>错误</th><th>最后错误</th><th>操作</th></tr></thead>
+<thead><tr><th>#</th><th>名称</th><th>备注</th><th>Key</th><th>状态</th><th>权重</th><th>30 分钟趋势</th><th>请求数</th><th>错误</th><th>最后错误</th><th>操作</th></tr></thead>
 <tbody id="rows"></tbody>
 </table>
+<div class="cards" id="cards"></div>
 
 <dialog id="dlg">
 <h3 style="margin:0 0 16px">添加 / 编辑 Key</h3>
@@ -1022,6 +1167,20 @@ dialog::backdrop{background:rgba(0,0,0,.6)}
 <div class="field"><label>备注</label><input id="f_note" placeholder="支付宝充值，2026-04-18"></div>
 <div class="field"><label>权重 (默认 1)</label><input id="f_weight" type="number" min="0.1" step="0.1" value="1"></div>
 <div class="row"><button class="secondary" id="dlgCancel">取消</button><button id="dlgSave">保存</button></div>
+</dialog>
+
+<dialog id="setDlg">
+<h3 style="margin:0 0 16px">运行时设置</h3>
+<div id="setErr"></div>
+<div class="field"><label><input type="checkbox" id="s_auto_thinking" style="width:auto;margin-right:6px"> 启用 auto_thinking（默认给请求注入 thinking 字段）</label></div>
+<div class="field"><label>thinking_budget_tokens (推理预算)</label><input id="s_thinking_budget_tokens" type="number" min="0" step="64"></div>
+<div class="field"><label>rate_limit_rpm (单 key 每分钟最大请求数)</label><input id="s_rate_limit_rpm" type="number" min="1"></div>
+<div class="field"><label>rpm_wait_max_ms (RPM 满时等待 ms，0=不等)</label><input id="s_rpm_wait_max_ms" type="number" min="0" step="500"></div>
+<div class="field"><label>quota_disable_ms (额度耗尽禁用 ms)</label><input id="s_quota_disable_ms" type="number" min="60000" step="60000"></div>
+<div class="field"><label>disable_backoff_ms (连续失败退避阶梯，逗号分隔 ms)</label><input id="s_disable_backoff_ms" placeholder="60000,300000,900000,1800000,3600000"></div>
+<div class="field"><label>max_retries (单请求最大重试次数)</label><input id="s_max_retries" type="number" min="0"></div>
+<div class="field"><label>request_timeout_ms (上游请求超时)</label><input id="s_request_timeout_ms" type="number" min="1000" step="1000"></div>
+<div class="row"><button class="secondary" id="setCancel">取消</button><button id="setSave">保存</button></div>
 </dialog>
 
 <script>
@@ -1075,25 +1234,73 @@ function rpmBar(k) {
     + '<span class="muted" style="font-size:11px">' + k.rpm_current + '/' + k.rpm_limit + ' rpm</span>';
 }
 
+function sparkline(history) {
+  if (!history || !history.length) return '';
+  const W = 120, H = 28, pad = 1;
+  const max = Math.max(1, ...history.map(b => Math.max(b.requests, b.errors)));
+  const stepX = (W - pad*2) / (history.length - 1);
+  const yOf = v => H - pad - (v / max) * (H - pad*2);
+  const path = key => history.map((b, i) => (i === 0 ? 'M' : 'L') + (pad + i*stepX).toFixed(1) + ',' + yOf(b[key]).toFixed(1)).join(' ');
+  const totalReq = history.reduce((s, b) => s + b.requests, 0);
+  const totalErr = history.reduce((s, b) => s + b.errors, 0);
+  return '<svg class="spark" width="' + W + '" height="' + H + '" viewBox="0 0 ' + W + ' ' + H + '">'
+    + '<line class="grid" x1="0" y1="' + (H/2) + '" x2="' + W + '" y2="' + (H/2) + '"/>'
+    + '<path class="req" d="' + path('requests') + '"/>'
+    + '<path class="err" d="' + path('errors') + '"/>'
+    + '</svg>'
+    + '<div class="muted" style="font-size:10px;line-height:1.2">'
+    + '<span style="color:#3b82f6">●</span>请求 ' + totalReq + ' / <span style="color:#ef4444">●</span>错 ' + totalErr
+    + '</div>';
+}
+
+function actionsHtml(k) {
+  return '<button class="secondary" onclick="testKey(' + k.index + ')" title="对该 key 发起一次真实 chat 调用">🧪 测试</button>'
+    + '<button class="secondary" onclick="edit(' + k.index + ')">编辑</button>'
+    + '<button class="' + (k.enabled ? 'secondary' : '') + '" onclick="toggle(' + k.index + ',' + (!k.enabled) + ')">' + (k.enabled ? '禁用' : '启用') + '</button>'
+    + '<button class="danger" onclick="del(' + k.index + ')">删除</button>';
+}
+
 function render(data) {
+  const escape = s => (s || '').replace(/[<>&"]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[c]));
   const tbody = document.getElementById('rows');
   tbody.innerHTML = data.keys.map(function(k) {
-    const note = (k.note || '').replace(/[<>&"]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[c]));
+    const note = escape(k.note);
     return '<tr>'
       + '<td>' + (k.index+1) + '</td>'
-      + '<td>' + k.name + '</td>'
+      + '<td>' + escape(k.name) + '</td>'
       + '<td><span class="muted">' + (note || '-') + '</span></td>'
       + '<td class="mono">' + k.key_masked + '</td>'
       + '<td><div class="status-cell">' + pill(k) + rpmBar(k) + '</div></td>'
       + '<td>' + k.weight + '</td>'
+      + '<td>' + sparkline(k.history) + '</td>'
       + '<td>' + k.requests + '</td>'
       + '<td>' + k.errors + (k.consecutive_errors ? ' <span class="muted">(连续 '+k.consecutive_errors+')</span>' : '') + '</td>'
-      + '<td class="muted" style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + (k.last_error || '-') + '</td>'
-      + '<td><div class="actions">'
-      + '<button class="secondary" onclick="edit(' + k.index + ')">编辑</button>'
-      + '<button class="' + (k.enabled ? 'secondary' : '') + '" onclick="toggle(' + k.index + ',' + (!k.enabled) + ')">' + (k.enabled ? '禁用' : '启用') + '</button>'
-      + '<button class="danger" onclick="del(' + k.index + ')">删除</button>'
-      + '</div></td></tr>';
+      + '<td class="muted" style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + escape(k.last_error || '-') + '</td>'
+      + '<td><div class="actions">' + actionsHtml(k) + '<div class="testresult" id="tr-' + k.index + '"></div></div></td>'
+      + '</tr>';
+  }).join('');
+
+  const cards = document.getElementById('cards');
+  cards.innerHTML = data.keys.map(function(k) {
+    return '<div class="card">'
+      + '<div class="row1">'
+      + '<div><div class="name">' + escape(k.name) + '</div>'
+      + '<div class="meta mono">' + k.key_masked + '</div>'
+      + (k.note ? '<div class="meta">' + escape(k.note) + '</div>' : '')
+      + '</div>'
+      + '<div>' + pill(k) + '</div>'
+      + '</div>'
+      + '<div class="body">'
+      + '<div><b>' + k.requests + '</b>请求</div>'
+      + '<div><b>' + k.errors + '</b>错误</div>'
+      + '<div><b>' + k.rpm_current + '/' + k.rpm_limit + '</b>RPM</div>'
+      + '<div><b>w=' + k.weight + '</b>权重</div>'
+      + '</div>'
+      + '<div style="margin-top:8px">' + sparkline(k.history) + '</div>'
+      + (k.last_error ? '<div class="meta" style="margin-top:6px;color:#fca5a5">⚠ ' + escape(k.last_error) + '</div>' : '')
+      + '<div class="actions">' + actionsHtml(k) + '</div>'
+      + '<div class="testresult" id="tr-card-' + k.index + '"></div>'
+      + '</div>';
   }).join('');
 
   const totalReq = data.keys.reduce((s,k)=>s+k.requests,0);
@@ -1220,6 +1427,71 @@ window.del = async function(idx) {
   catch(e) { document.getElementById('err').innerHTML = '<div class="error">' + e.message + '</div>'; }
 };
 
+window.testKey = async function(idx) {
+  const tEls = [document.getElementById('tr-' + idx), document.getElementById('tr-card-' + idx)].filter(Boolean);
+  tEls.forEach(el => { el.className = 'testresult'; el.textContent = '🧪 测试中...'; });
+  try {
+    const r = await api('POST', '/admin/api/keys/' + idx + '/chat-test');
+    const summary = (r.ok ? '✓ ' : '✗ ') + 'HTTP ' + r.status + ' · ' + r.latency_ms + 'ms'
+      + (r.upstream_model ? ' · ' + r.upstream_model : '')
+      + (r.error ? '\n' + r.error : '\n' + (r.reply || '(no content)').slice(0, 160));
+    tEls.forEach(el => { el.className = 'testresult ' + (r.ok ? 'ok' : 'fail'); el.textContent = summary; });
+  } catch (e) {
+    tEls.forEach(el => { el.className = 'testresult fail'; el.textContent = '✗ ' + e.message; });
+  }
+};
+
+document.getElementById('recoverAllBtn').onclick = async () => {
+  if (!confirm('确认强制清空所有 key 的暂禁/退避状态？')) return;
+  try {
+    const r = await api('POST', '/admin/api/recover-all');
+    document.getElementById('msg').innerHTML = '<div class="success">已恢复 ' + r.recovered + ' 个 key</div>';
+    setTimeout(() => { document.getElementById('msg').innerHTML = ''; }, 4000);
+    load();
+  } catch (e) { document.getElementById('err').innerHTML = '<div class="error">' + e.message + '</div>'; }
+};
+
+const setDlg = document.getElementById('setDlg');
+document.getElementById('settingsBtn').onclick = async () => {
+  document.getElementById('setErr').innerHTML = '';
+  try {
+    const r = await api('GET', '/admin/api/runtime');
+    document.getElementById('s_auto_thinking').checked = !!r.auto_thinking;
+    document.getElementById('s_thinking_budget_tokens').value = r.thinking_budget_tokens;
+    document.getElementById('s_rate_limit_rpm').value = r.rate_limit_rpm;
+    document.getElementById('s_rpm_wait_max_ms').value = r.rpm_wait_max_ms;
+    document.getElementById('s_quota_disable_ms').value = r.quota_disable_ms;
+    document.getElementById('s_disable_backoff_ms').value = (r.disable_backoff_ms || []).join(',');
+    document.getElementById('s_max_retries').value = r.max_retries;
+    document.getElementById('s_request_timeout_ms').value = r.request_timeout_ms;
+    setDlg.showModal();
+  } catch (e) { document.getElementById('err').innerHTML = '<div class="error">' + e.message + '</div>'; }
+};
+document.getElementById('setCancel').onclick = () => setDlg.close();
+document.getElementById('setSave').onclick = async () => {
+  const numF = id => parseFloat(document.getElementById(id).value);
+  const backoffStr = document.getElementById('s_disable_backoff_ms').value.trim();
+  const backoffArr = backoffStr ? backoffStr.split(',').map(s => parseInt(s.trim(), 10)).filter(n => Number.isFinite(n)) : [];
+  const payload = {
+    auto_thinking: document.getElementById('s_auto_thinking').checked,
+    thinking_budget_tokens: numF('s_thinking_budget_tokens'),
+    rate_limit_rpm: numF('s_rate_limit_rpm'),
+    rpm_wait_max_ms: numF('s_rpm_wait_max_ms'),
+    quota_disable_ms: numF('s_quota_disable_ms'),
+    disable_backoff_ms: backoffArr,
+    max_retries: numF('s_max_retries'),
+    request_timeout_ms: numF('s_request_timeout_ms')
+  };
+  try {
+    await api('PATCH', '/admin/api/runtime', payload);
+    setDlg.close();
+    document.getElementById('msg').innerHTML = '<div class="success">设置已保存（已写入 config.json）</div>';
+    setTimeout(() => { document.getElementById('msg').innerHTML = ''; }, 4000);
+  } catch (e) {
+    document.getElementById('setErr').innerHTML = '<div class="error">' + e.message + '</div>';
+  }
+};
+
 (async () => {
   await load();
   await runProbe('auto');
@@ -1262,6 +1534,80 @@ function handleAdminRequest(req, res) {
     });
     console.log(`[INFO] 管理端手动触发探活: ${triggered} 个 key`);
     adminSendJson(res, 200, { ok: true, triggered });
+    return true;
+  }
+
+  if (req.url === '/admin/api/recover-all' && req.method === 'POST') {
+    let recovered = 0;
+    keyPool.forEach(function (k) {
+      const wasBlocked = !k.enabled || k.disabledUntil > Date.now() || k.disableTier > 0;
+      const cfgKey = (CONFIG.keys || [])[k.index] || {};
+      const cfgAllows = cfgKey.enabled !== false;
+      if (wasBlocked && cfgAllows) {
+        k.enabled = true;
+        k.disabledUntil = 0;
+        k.consecutiveErrors = 0;
+        k.disableTier = 0;
+        k.lastError = '';
+        k.probeStatus = null;
+        recovered += 1;
+      }
+    });
+    console.log('[INFO] 管理端一键恢复:', recovered, '个 key');
+    adminSendJson(res, 200, { ok: true, recovered });
+    return true;
+  }
+
+  if (req.url === '/admin/api/runtime' && req.method === 'GET') {
+    adminSendJson(res, 200, {
+      auto_thinking: !!CONFIG.auto_thinking,
+      thinking_budget_tokens: CONFIG.thinking_budget_tokens || 512,
+      rate_limit_rpm: CONFIG.rate_limit_rpm || 30,
+      rpm_wait_max_ms: CONFIG.rpm_wait_max_ms != null ? CONFIG.rpm_wait_max_ms : 5000,
+      quota_disable_ms: CONFIG.quota_disable_ms != null ? CONFIG.quota_disable_ms : 3600000,
+      disable_backoff_ms: CONFIG.disable_backoff_ms || DEFAULT_CONFIG.disable_backoff_ms,
+      max_retries: CONFIG.max_retries != null ? CONFIG.max_retries : 2,
+      request_timeout_ms: CONFIG.request_timeout_ms || 120000
+    });
+    return true;
+  }
+
+  if (req.url === '/admin/api/runtime' && req.method === 'PATCH') {
+    let body = '';
+    req.on('data', c => body += c);
+    req.on('end', function () {
+      try {
+        const payload = JSON.parse(body || '{}');
+        const allowed = ['auto_thinking', 'thinking_budget_tokens', 'rate_limit_rpm', 'rpm_wait_max_ms', 'quota_disable_ms', 'disable_backoff_ms', 'max_retries', 'request_timeout_ms'];
+        for (const k of allowed) {
+          if (!(k in payload)) continue;
+          const v = payload[k];
+          if (k === 'auto_thinking') CONFIG[k] = !!v;
+          else if (k === 'disable_backoff_ms') {
+            if (!Array.isArray(v) || v.some(n => typeof n !== 'number' || n < 1000)) throw new Error(`${k} 必须是 ms 数组（每项 >=1000）`);
+            CONFIG[k] = v.slice();
+          }
+          else {
+            if (typeof v !== 'number' || !Number.isFinite(v) || v < 0) throw new Error(`${k} 必须是 >=0 的数字`);
+            CONFIG[k] = v;
+          }
+        }
+        saveConfigToDisk();
+        console.log('[INFO] 管理端更新运行时配置:', Object.keys(payload).join(','));
+        adminSendJson(res, 200, { ok: true });
+      } catch (error) {
+        adminSendJson(res, 400, { error: error.message });
+      }
+    });
+    return true;
+  }
+
+  const chatTestMatch = req.url.match(/^\/admin\/api\/keys\/(\d+)\/chat-test$/);
+  if (chatTestMatch && req.method === 'POST') {
+    const idx = parseInt(chatTestMatch[1], 10);
+    const k = keyPool[idx];
+    if (!k) { adminSendJson(res, 404, { error: 'index 越界' }); return true; }
+    runChatTest(k, function (result) { adminSendJson(res, 200, result); });
     return true;
   }
 
@@ -1369,15 +1715,23 @@ const server = http.createServer(function (req, res) {
     stats.lastRequestAt = Date.now();
     markRoute(req.url);
 
-    const keyObj = getNextKey();
-    if (!keyObj) {
-      stats.requestsFailed += 1;
-      res.writeHead(503, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: { message: '所有 key 不可用', type: 'service_unavailable' } }));
-      sendFeishu('[Kimi Proxy] 所有 Key 不可用，服务降级');
-      return;
-    }
+    getNextKeyOrWait(function (keyObj, waitedMs) {
+      if (!keyObj) {
+        stats.requestsFailed += 1;
+        res.writeHead(503, { 'Content-Type': 'application/json' });
+        const reason = hasAnyEnabledKey()
+          ? `所有 key RPM 已满，已等 ${waitedMs}ms 仍无可用 key`
+          : '所有 key 不可用';
+        res.end(JSON.stringify({ error: { message: reason, type: 'service_unavailable' } }));
+        sendFeishu('[Kimi Proxy] ' + reason);
+        return;
+      }
+      handleProxiedRequest(req, res, body, keyObj);
+    });
+  });
+});
 
+function handleProxiedRequest(req, res, body, keyObj) {
     try {
       const json = JSON.parse(body || '{}');
 
@@ -1430,8 +1784,7 @@ const server = http.createServer(function (req, res) {
       console.log(`[${nowIso()}] ${req.method} ${req.url} → key:${keyObj.name} (raw)`);
       proxyRequest(req, res, body, keyObj, 0);
     }
-  });
-});
+}
 
 server.listen(CONFIG.port || 8919, CONFIG.host || '0.0.0.0', function () {
   console.log('========================================');
