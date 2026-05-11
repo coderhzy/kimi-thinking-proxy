@@ -22,6 +22,7 @@ const DEFAULT_CONFIG = {
   max_retries: 2,
   request_timeout_ms: 120000,
   disable_backoff_ms: [60000, 300000, 900000, 1800000, 3600000],
+  quota_disable_ms: 0,
   force_temperature: {},
   admin: {
     enabled: false,
@@ -386,9 +387,13 @@ function markKeySuccess(keyObj) {
   keyObj.lastError = '';
 }
 
+function isRateLimitError(statusCode) {
+  return statusCode === 429;
+}
+
 function isQuotaError(statusCode, body) {
   if (statusCode === 402) return true;
-  if (statusCode === 403 || statusCode === 429) {
+  if (statusCode === 403) {
     const text = (body || '').toLowerCase();
     if (text.includes('access_terminated_error')) return true;
     if (text.includes('usage limit') || text.includes('billing cycle')) return true;
@@ -397,18 +402,14 @@ function isQuotaError(statusCode, body) {
   return false;
 }
 
-function markKeyQuotaExhausted(keyObj) {
+function markKeyUpstreamLimit(keyObj, statusCode, body) {
   if (!keyObj) return;
-  const banMs = (CONFIG.quota_disable_ms != null) ? CONFIG.quota_disable_ms : 60 * 60 * 1000;
-  keyObj.enabled = false;
-  keyObj.disabledUntil = Date.now() + banMs;
-  keyObj.lastError = 'quota exhausted';
+  keyObj.lastError = isRateLimitError(statusCode) ? 'upstream rate limited' : 'upstream quota limited';
   keyObj.lastErrorTime = Date.now();
   keyObj.errorCount += 1;
   bumpHistory(keyObj, 'errors');
-  const humanDur = banMs >= 60000 ? `${Math.round(banMs / 60000)} 分钟` : `${Math.round(banMs / 1000)} 秒`;
-  console.log('[WARN] Key', keyObj.name, `额度耗尽，禁用 ${humanDur}（探活成功会自动恢复）`);
-  sendFeishu(`[Kimi Proxy] Key ${keyObj.name} 额度耗尽，已禁用 ${humanDur}`);
+  const sample = String(body || '').replace(/\s+/g, ' ').slice(0, 180);
+  console.log('[WARN] Key', keyObj.name, `上游限制 HTTP ${statusCode}，本地不禁用 key${sample ? ': ' + sample : ''}`);
 }
 
 function markKeyError(keyObj, message, options) {
@@ -476,6 +477,7 @@ function shouldRetryStatus(statusCode, body) {
   if (!CONFIG.retry_on_http_error) return false;
   if (statusCode === 401) return true;
   if (statusCode >= 500) return true;
+  if (isRateLimitError(statusCode)) return true;
   if (isQuotaError(statusCode, body)) return true;
   return false;
 }
@@ -589,12 +591,12 @@ function probeKey(keyObj) {
       const fullText = Buffer.concat(chunks).toString('utf-8');
       const text = fullText.slice(0, 300);
 
-      if (isQuotaError(res.statusCode, fullText)) {
-        keyObj.probeStatus = 'quota_exhausted';
-        if (keyObj.enabled) {
-          console.log(`[WARN] Key ${keyObj.name} 探活 HTTP ${res.statusCode}，额度耗尽`);
-          markKeyQuotaExhausted(keyObj);
-        }
+      if (isRateLimitError(res.statusCode)) {
+        keyObj.probeStatus = 'rate_limited';
+        markKeyUpstreamLimit(keyObj, res.statusCode, fullText);
+      } else if (isQuotaError(res.statusCode, fullText)) {
+        keyObj.probeStatus = 'quota_limited';
+        markKeyUpstreamLimit(keyObj, res.statusCode, fullText);
       } else if (res.statusCode === 401) {
         keyObj.probeStatus = 'invalid';
         if (keyObj.enabled) markKeyDead(keyObj, `HTTP 401: ${text}`);
@@ -882,7 +884,7 @@ function proxyRequest(req, res, bodyStr, keyObj, retryCount) {
         proxyRes.on('data', c => chunks.push(c));
         proxyRes.on('end', function () {
           const errBody = Buffer.concat(chunks).toString('utf-8');
-          if (isQuotaError(proxyRes.statusCode, errBody)) markKeyQuotaExhausted(keyObj);
+          if (isRateLimitError(proxyRes.statusCode) || isQuotaError(proxyRes.statusCode, errBody)) markKeyUpstreamLimit(keyObj, proxyRes.statusCode, errBody);
           else if (proxyRes.statusCode === 401) markKeyDead(keyObj, `HTTP 401: ${errBody.slice(0,200)}`);
           else markKeyError(keyObj, `HTTP ${proxyRes.statusCode}`, { transient: true });
           const nextKey = getNextKey(keyObj);
@@ -914,10 +916,10 @@ function proxyRequest(req, res, bodyStr, keyObj, retryCount) {
           markKeySuccess(keyObj);
           stats.requestsSucceeded += 1;
         } else {
-          if (isQuotaError(proxyRes.statusCode, errorBody)) {
-            markKeyQuotaExhausted(keyObj);
+          if (isRateLimitError(proxyRes.statusCode) || isQuotaError(proxyRes.statusCode, errorBody)) {
+            markKeyUpstreamLimit(keyObj, proxyRes.statusCode, errorBody);
           } else {
-            const transient = proxyRes.statusCode === 429 || proxyRes.statusCode >= 500;
+            const transient = proxyRes.statusCode >= 500;
             markKeyError(keyObj, `HTTP ${proxyRes.statusCode}`, { transient });
           }
           stats.requestsFailed += 1;
@@ -936,12 +938,12 @@ function proxyRequest(req, res, bodyStr, keyObj, retryCount) {
         markKeySuccess(keyObj);
         stats.requestsSucceeded += 1;
       } else {
-        if (isQuotaError(proxyRes.statusCode, respBody)) {
-          markKeyQuotaExhausted(keyObj);
+        if (isRateLimitError(proxyRes.statusCode) || isQuotaError(proxyRes.statusCode, respBody)) {
+          markKeyUpstreamLimit(keyObj, proxyRes.statusCode, respBody);
         } else if (proxyRes.statusCode === 401) {
           markKeyDead(keyObj, `HTTP 401: ${respBody.slice(0, 200)}`);
         } else {
-          const transient = proxyRes.statusCode === 429 || proxyRes.statusCode >= 500;
+          const transient = proxyRes.statusCode >= 500;
           markKeyError(keyObj, `HTTP ${proxyRes.statusCode}`, { transient });
         }
         stats.requestsFailed += 1;
@@ -1040,10 +1042,13 @@ function deriveKeyState(k, rpm) {
   if (k.probeStatus === 'invalid') return { level: 'dead', label: '失效', reason: 'HTTP 401 / key 过期' };
   if (k.probeStatus === 'forbidden') return { level: 'dead', label: '已屏蔽', reason: 'HTTP 403' };
   if (!k.enabled) {
-    if (k.probeStatus === 'quota_exhausted' || k.lastError === 'quota exhausted') {
-      return { level: 'quota', label: '额度耗尽', reason: '402 / 403 access_terminated' };
-    }
     return { level: 'paused', label: '暂禁', reason: `退避 tier ${k.disableTier}` };
+  }
+  if (k.probeStatus === 'rate_limited' || k.lastError === 'upstream rate limited') {
+    return { level: 'warn', label: '上游频限', reason: 'HTTP 429（本地不禁用）' };
+  }
+  if (k.probeStatus === 'quota_limited' || k.lastError === 'upstream quota limited') {
+    return { level: 'quota', label: '上游限制', reason: '402 / 403（本地不禁用）' };
   }
   if (rpm && k.minuteRequests && k.minuteRequests.length >= rpm) {
     return { level: 'throttle', label: '限流', reason: `当前分钟已用 ${k.minuteRequests.length}/${rpm}` };
@@ -1214,7 +1219,7 @@ dialog::backdrop{background:rgba(0,0,0,.6)}
 <div class="field"><label><input type="checkbox" id="s_local_rate_limit_enabled" style="width:auto;margin-right:6px"> 启用本地 RPM 限流（默认关闭）</label></div>
 <div class="field"><label>rate_limit_rpm (启用限流时，单 key 每分钟最大请求数)</label><input id="s_rate_limit_rpm" type="number" min="0"></div>
 <div class="field"><label>rpm_wait_max_ms (RPM 满时等待 ms，0=不等；限流关闭时忽略)</label><input id="s_rpm_wait_max_ms" type="number" min="0" step="500"></div>
-<div class="field"><label>quota_disable_ms (额度耗尽禁用 ms)</label><input id="s_quota_disable_ms" type="number" min="60000" step="60000"></div>
+<div class="field"><label>quota_disable_ms (兼容旧配置；上游额度/频限现在本地不禁用)</label><input id="s_quota_disable_ms" type="number" min="0" step="60000"></div>
 <div class="field"><label>disable_backoff_ms (连续失败退避阶梯，逗号分隔 ms)</label><input id="s_disable_backoff_ms" placeholder="60000,300000,900000,1800000,3600000"></div>
 <div class="field"><label>max_retries (单请求最大重试次数)</label><input id="s_max_retries" type="number" min="0"></div>
 <div class="field"><label>request_timeout_ms (上游请求超时)</label><input id="s_request_timeout_ms" type="number" min="1000" step="1000"></div>
@@ -1614,7 +1619,7 @@ function handleAdminRequest(req, res) {
       rate_limit_rpm: CONFIG.rate_limit_rpm != null ? CONFIG.rate_limit_rpm : 0,
       rpm_effective_limit: getRpmLimit(),
       rpm_wait_max_ms: CONFIG.rpm_wait_max_ms != null ? CONFIG.rpm_wait_max_ms : 0,
-      quota_disable_ms: CONFIG.quota_disable_ms != null ? CONFIG.quota_disable_ms : 3600000,
+      quota_disable_ms: CONFIG.quota_disable_ms != null ? CONFIG.quota_disable_ms : 0,
       disable_backoff_ms: CONFIG.disable_backoff_ms || DEFAULT_CONFIG.disable_backoff_ms,
       max_retries: CONFIG.max_retries != null ? CONFIG.max_retries : 2,
       request_timeout_ms: CONFIG.request_timeout_ms || 120000

@@ -56,6 +56,7 @@ Key fields:
 - `keys`: multiple API keys for rotation
 - `local_rate_limit_enabled`: enable local per-key RPM limiting; default `false`
 - `rate_limit_rpm`: per-key requests per minute when local RPM limiting is enabled
+- `quota_disable_ms`: legacy compatibility value; upstream quota/rate-limit responses are recorded but do not locally disable keys
 - `max_retries`: retry count on upstream/network failure
 - `request_timeout_ms`: upstream timeout
 - `auto_thinking`: inject `enable_thinking=true` when absent

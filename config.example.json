@@ -12,7 +12,7 @@
   "request_timeout_ms": 120000,
   "retry_on_http_error": true,
   "disable_backoff_ms": [60000, 300000, 900000, 1800000, 3600000],
-  "quota_disable_ms": 3600000,
+  "quota_disable_ms": 0,
   "rpm_wait_max_ms": 0,
   "force_temperature": {},
   "models": [
