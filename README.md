@@ -7,7 +7,7 @@ A lightweight **OpenAI-compatible proxy** for **Kimi coding/thinking** endpoints
 This proxy sits between your panel/client and Kimi upstream, and adds a few practical capabilities that generic gateways often miss:
 
 - multi-key round-robin rotation
-- per-key RPM limiting
+- optional per-key RPM limiting (disabled by default)
 - temporary circuit breaking after repeated failures
 - auto recovery for disabled keys
 - `enable_thinking` auto injection
@@ -54,7 +54,8 @@ Key fields:
 - `target_host`: upstream host, usually `api.kimi.com`
 - `target_path_prefix`: upstream path prefix, e.g. `/coding`
 - `keys`: multiple API keys for rotation
-- `rate_limit_rpm`: per-key requests per minute
+- `local_rate_limit_enabled`: enable local per-key RPM limiting; default `false`
+- `rate_limit_rpm`: per-key requests per minute when local RPM limiting is enabled
 - `max_retries`: retry count on upstream/network failure
 - `request_timeout_ms`: upstream timeout
 - `auto_thinking`: inject `enable_thinking=true` when absent
@@ -71,7 +72,9 @@ All important config values can be overridden with env vars:
 - `TARGET_PATH_PREFIX`
 - `CODING_UA`
 - `AUTO_THINKING`
+- `LOCAL_RATE_LIMIT_ENABLED`
 - `RATE_LIMIT_RPM`
+- `RPM_WAIT_MAX_MS`
 - `MAX_RETRIES`
 - `REQUEST_TIMEOUT_MS`
 - `KIMI_KEYS` (comma-separated)
@@ -124,7 +127,7 @@ It uses Node built-ins only, which makes it easy to audit and deploy.
 
 - run behind Nginx or Caddy
 - keep `config.json` out of git
-- use multiple Kimi keys if you need higher throughput
+- use multiple Kimi keys if you need higher upstream throughput
 - scrape `/metrics` with Prometheus if you want observability
 - place this behind your panel/gateway such as New API
 

@@ -16,8 +16,9 @@ const DEFAULT_CONFIG = {
   coding_ua: 'claude-cli/2.1.44 (external, sdk-cli)',
   auto_thinking: true,
   thinking_budget_tokens: 512,
-  rate_limit_rpm: 30,
-  rpm_wait_max_ms: 5000,
+  local_rate_limit_enabled: false,
+  rate_limit_rpm: 0,
+  rpm_wait_max_ms: 0,
   max_retries: 2,
   request_timeout_ms: 120000,
   disable_backoff_ms: [60000, 300000, 900000, 1800000, 3600000],
@@ -116,7 +117,9 @@ function loadConfig() {
     cfg.target_path_prefix = process.env.TARGET_PATH_PREFIX || cfg.target_path_prefix;
     cfg.coding_ua = process.env.CODING_UA || cfg.coding_ua;
     cfg.auto_thinking = envBool('AUTO_THINKING', cfg.auto_thinking);
+    cfg.local_rate_limit_enabled = envBool('LOCAL_RATE_LIMIT_ENABLED', cfg.local_rate_limit_enabled);
     cfg.rate_limit_rpm = envNumber('RATE_LIMIT_RPM', cfg.rate_limit_rpm);
+    cfg.rpm_wait_max_ms = envNumber('RPM_WAIT_MAX_MS', cfg.rpm_wait_max_ms);
     cfg.max_retries = envNumber('MAX_RETRIES', cfg.max_retries);
     cfg.request_timeout_ms = envNumber('REQUEST_TIMEOUT_MS', cfg.request_timeout_ms);
 
@@ -248,11 +251,22 @@ function sendFeishu(text) {
   req.end();
 }
 
+function isRpmLimitEnabled() {
+  return CONFIG.local_rate_limit_enabled === true;
+}
+
+function getRpmLimit() {
+  if (!isRpmLimitEnabled()) return 0;
+  const rpm = Number(CONFIG.rate_limit_rpm);
+  return Number.isFinite(rpm) ? rpm : 0;
+}
+
 function getNextKey(excludeKey) {
   if (!keyPool.length) return null;
 
   const now = Date.now();
-  const rpm = CONFIG.rate_limit_rpm || 30;
+  const rpm = getRpmLimit();
+  const rpmLimited = rpm > 0;
   const cutoff = now - 60000;
 
   for (const item of keyPool) {
@@ -273,7 +287,7 @@ function getNextKey(excludeKey) {
     if (excludeKey && candidate === excludeKey) continue;
     if (!candidate.enabled) continue;
     if (candidate.disabledUntil && candidate.disabledUntil > now) continue;
-    if (candidate.minuteRequests.length >= rpm) continue;
+    if (rpmLimited && candidate.minuteRequests.length >= rpm) continue;
 
     const weight = candidate.weight || 1;
     const load = candidate.minuteRequests.length / weight;
@@ -320,9 +334,28 @@ function hasAnyEnabledKey() {
   });
 }
 
+function getNextRpmReleaseMs() {
+  const now = Date.now();
+  const rpm = getRpmLimit();
+  if (rpm <= 0) return null;
+  let next = Infinity;
+
+  for (const k of keyPool) {
+    if (!k.enabled) continue;
+    if (k.disabledUntil && k.disabledUntil > now) continue;
+    if (!Array.isArray(k.minuteRequests) || k.minuteRequests.length < rpm) continue;
+
+    const oldest = Math.min.apply(null, k.minuteRequests);
+    const releaseIn = Math.max(0, oldest + 60000 - now);
+    if (releaseIn < next) next = releaseIn;
+  }
+
+  return Number.isFinite(next) ? next : null;
+}
+
 function getNextKeyOrWait(callback) {
   const start = Date.now();
-  const maxWait = (CONFIG.rpm_wait_max_ms != null) ? CONFIG.rpm_wait_max_ms : 5000;
+  const maxWait = Math.max(0, (CONFIG.rpm_wait_max_ms != null) ? CONFIG.rpm_wait_max_ms : 0);
   const tick = function () {
     const k = getNextKey();
     if (k) {
@@ -331,11 +364,17 @@ function getNextKeyOrWait(callback) {
         stats.rpmWaitedRequests += 1;
         stats.rpmWaitTotalMs += waited;
       }
-      return callback(k, waited);
+      return callback(k, waited, { retryAfterMs: 0 });
     }
-    if (!hasAnyEnabledKey()) return callback(null, Date.now() - start);
-    if (Date.now() - start >= maxWait) return callback(null, Date.now() - start);
-    setTimeout(tick, 200);
+
+    const waited = Date.now() - start;
+    const retryAfterMs = getNextRpmReleaseMs();
+    if (!hasAnyEnabledKey()) return callback(null, waited, { retryAfterMs: null });
+    if (waited >= maxWait) return callback(null, waited, { retryAfterMs });
+
+    const remaining = maxWait - waited;
+    const nextDelay = retryAfterMs == null ? 200 : Math.min(200, Math.max(1, retryAfterMs));
+    setTimeout(tick, Math.min(nextDelay, remaining));
   };
   tick();
 }
@@ -415,6 +454,7 @@ function saveConfigToDisk() {
     coding_ua: CONFIG.coding_ua,
     auto_thinking: CONFIG.auto_thinking,
     thinking_budget_tokens: CONFIG.thinking_budget_tokens,
+    local_rate_limit_enabled: !!CONFIG.local_rate_limit_enabled,
     rate_limit_rpm: CONFIG.rate_limit_rpm,
     rpm_wait_max_ms: CONFIG.rpm_wait_max_ms,
     max_retries: CONFIG.max_retries,
@@ -1018,7 +1058,7 @@ function deriveKeyState(k, rpm) {
 }
 
 function adminListKeys() {
-  const rpm = CONFIG.rate_limit_rpm || 30;
+  const rpm = getRpmLimit();
   return keyPool.map(function (k, idx) {
     const cfgKey = (CONFIG.keys || [])[idx] || {};
     const state = deriveKeyState(k, rpm);
@@ -1171,8 +1211,9 @@ dialog::backdrop{background:rgba(0,0,0,.6)}
 <div id="setErr"></div>
 <div class="field"><label><input type="checkbox" id="s_auto_thinking" style="width:auto;margin-right:6px"> 启用 auto_thinking（默认给请求注入 thinking 字段）</label></div>
 <div class="field"><label>thinking_budget_tokens (推理预算)</label><input id="s_thinking_budget_tokens" type="number" min="0" step="64"></div>
-<div class="field"><label>rate_limit_rpm (单 key 每分钟最大请求数)</label><input id="s_rate_limit_rpm" type="number" min="1"></div>
-<div class="field"><label>rpm_wait_max_ms (RPM 满时等待 ms，0=不等)</label><input id="s_rpm_wait_max_ms" type="number" min="0" step="500"></div>
+<div class="field"><label><input type="checkbox" id="s_local_rate_limit_enabled" style="width:auto;margin-right:6px"> 启用本地 RPM 限流（默认关闭）</label></div>
+<div class="field"><label>rate_limit_rpm (启用限流时，单 key 每分钟最大请求数)</label><input id="s_rate_limit_rpm" type="number" min="0"></div>
+<div class="field"><label>rpm_wait_max_ms (RPM 满时等待 ms，0=不等；限流关闭时忽略)</label><input id="s_rpm_wait_max_ms" type="number" min="0" step="500"></div>
 <div class="field"><label>quota_disable_ms (额度耗尽禁用 ms)</label><input id="s_quota_disable_ms" type="number" min="60000" step="60000"></div>
 <div class="field"><label>disable_backoff_ms (连续失败退避阶梯，逗号分隔 ms)</label><input id="s_disable_backoff_ms" placeholder="60000,300000,900000,1800000,3600000"></div>
 <div class="field"><label>max_retries (单请求最大重试次数)</label><input id="s_max_retries" type="number" min="0"></div>
@@ -1224,11 +1265,19 @@ function pill(k) {
   return '<span class="pill ' + cls + '" title="' + title + '">' + k.state_label + '</span>' + extra;
 }
 
+function rpmText(k) {
+  return k.rpm_limit > 0 ? (k.rpm_current + '/' + k.rpm_limit + ' rpm') : (k.rpm_current + '/不限流 rpm');
+}
+
 function rpmBar(k) {
+  if (!k.rpm_limit || k.rpm_limit <= 0) {
+    return '<div class="rpm-bar"><div style="width:0%"></div></div>'
+      + '<span class="muted" style="font-size:11px">' + rpmText(k) + '</span>';
+  }
   const pct = Math.min(100, Math.round((k.rpm_current / k.rpm_limit) * 100));
   const cls = pct >= 100 ? 'full' : (pct >= 80 ? 'hot' : '');
   return '<div class="rpm-bar ' + cls + '"><div style="width:' + pct + '%"></div></div>'
-    + '<span class="muted" style="font-size:11px">' + k.rpm_current + '/' + k.rpm_limit + ' rpm</span>';
+    + '<span class="muted" style="font-size:11px">' + rpmText(k) + '</span>';
 }
 
 function sparkline(history) {
@@ -1290,7 +1339,7 @@ function render(data) {
       + '<div class="body">'
       + '<div><b>' + k.requests + '</b>请求</div>'
       + '<div><b>' + k.errors + '</b>错误</div>'
-      + '<div><b>' + k.rpm_current + '/' + k.rpm_limit + '</b>RPM</div>'
+      + '<div><b>' + rpmText(k).replace(' rpm', '') + '</b>RPM</div>'
       + '<div><b>w=' + k.weight + '</b>权重</div>'
       + '</div>'
       + '<div style="margin-top:8px">' + sparkline(k.history) + '</div>'
@@ -1455,6 +1504,7 @@ document.getElementById('settingsBtn').onclick = async () => {
     const r = await api('GET', '/admin/api/runtime');
     document.getElementById('s_auto_thinking').checked = !!r.auto_thinking;
     document.getElementById('s_thinking_budget_tokens').value = r.thinking_budget_tokens;
+    document.getElementById('s_local_rate_limit_enabled').checked = !!r.local_rate_limit_enabled;
     document.getElementById('s_rate_limit_rpm').value = r.rate_limit_rpm;
     document.getElementById('s_rpm_wait_max_ms').value = r.rpm_wait_max_ms;
     document.getElementById('s_quota_disable_ms').value = r.quota_disable_ms;
@@ -1472,6 +1522,7 @@ document.getElementById('setSave').onclick = async () => {
   const payload = {
     auto_thinking: document.getElementById('s_auto_thinking').checked,
     thinking_budget_tokens: numF('s_thinking_budget_tokens'),
+    local_rate_limit_enabled: document.getElementById('s_local_rate_limit_enabled').checked,
     rate_limit_rpm: numF('s_rate_limit_rpm'),
     rpm_wait_max_ms: numF('s_rpm_wait_max_ms'),
     quota_disable_ms: numF('s_quota_disable_ms'),
@@ -1559,8 +1610,10 @@ function handleAdminRequest(req, res) {
     adminSendJson(res, 200, {
       auto_thinking: !!CONFIG.auto_thinking,
       thinking_budget_tokens: CONFIG.thinking_budget_tokens || 512,
-      rate_limit_rpm: CONFIG.rate_limit_rpm || 30,
-      rpm_wait_max_ms: CONFIG.rpm_wait_max_ms != null ? CONFIG.rpm_wait_max_ms : 5000,
+      local_rate_limit_enabled: !!CONFIG.local_rate_limit_enabled,
+      rate_limit_rpm: CONFIG.rate_limit_rpm != null ? CONFIG.rate_limit_rpm : 0,
+      rpm_effective_limit: getRpmLimit(),
+      rpm_wait_max_ms: CONFIG.rpm_wait_max_ms != null ? CONFIG.rpm_wait_max_ms : 0,
       quota_disable_ms: CONFIG.quota_disable_ms != null ? CONFIG.quota_disable_ms : 3600000,
       disable_backoff_ms: CONFIG.disable_backoff_ms || DEFAULT_CONFIG.disable_backoff_ms,
       max_retries: CONFIG.max_retries != null ? CONFIG.max_retries : 2,
@@ -1575,11 +1628,11 @@ function handleAdminRequest(req, res) {
     req.on('end', function () {
       try {
         const payload = JSON.parse(body || '{}');
-        const allowed = ['auto_thinking', 'thinking_budget_tokens', 'rate_limit_rpm', 'rpm_wait_max_ms', 'quota_disable_ms', 'disable_backoff_ms', 'max_retries', 'request_timeout_ms'];
+        const allowed = ['auto_thinking', 'thinking_budget_tokens', 'local_rate_limit_enabled', 'rate_limit_rpm', 'rpm_wait_max_ms', 'quota_disable_ms', 'disable_backoff_ms', 'max_retries', 'request_timeout_ms'];
         for (const k of allowed) {
           if (!(k in payload)) continue;
           const v = payload[k];
-          if (k === 'auto_thinking') CONFIG[k] = !!v;
+          if (k === 'auto_thinking' || k === 'local_rate_limit_enabled') CONFIG[k] = !!v;
           else if (k === 'disable_backoff_ms') {
             if (!Array.isArray(v) || v.some(n => typeof n !== 'number' || n < 1000)) throw new Error(`${k} 必须是 ms 数组（每项 >=1000）`);
             CONFIG[k] = v.slice();
@@ -1712,15 +1765,23 @@ const server = http.createServer(function (req, res) {
     stats.lastRequestAt = Date.now();
     markRoute(req.url);
 
-    getNextKeyOrWait(function (keyObj, waitedMs) {
+    getNextKeyOrWait(function (keyObj, waitedMs, waitInfo) {
       if (!keyObj) {
         stats.requestsFailed += 1;
-        res.writeHead(503, { 'Content-Type': 'application/json' });
-        const reason = hasAnyEnabledKey()
+        const anyEnabled = hasAnyEnabledKey();
+        const retryAfterMs = waitInfo && typeof waitInfo.retryAfterMs === 'number'
+          ? Math.ceil(waitInfo.retryAfterMs)
+          : null;
+        const headers = { 'Content-Type': 'application/json' };
+        if (retryAfterMs != null) headers['Retry-After'] = String(Math.max(1, Math.ceil(retryAfterMs / 1000)));
+        res.writeHead(503, headers);
+        const reason = anyEnabled
           ? `所有 key RPM 已满，已等 ${waitedMs}ms 仍无可用 key`
           : '所有 key 不可用';
-        res.end(JSON.stringify({ error: { message: reason, type: 'service_unavailable' } }));
-        sendFeishu('[Kimi Proxy] ' + reason);
+        const error = { message: reason, type: 'service_unavailable' };
+        if (retryAfterMs != null) error.retry_after_ms = retryAfterMs;
+        res.end(JSON.stringify({ error }));
+        sendFeishu('[Kimi Proxy] ' + reason + (retryAfterMs != null ? `，预计 ${retryAfterMs}ms 后可重试` : ''));
         return;
       }
       handleProxiedRequest(req, res, body, keyObj);
@@ -1795,7 +1856,7 @@ server.listen(CONFIG.port || 8919, CONFIG.host || '0.0.0.0', function () {
   console.log('  Host: ' + (CONFIG.host || '0.0.0.0'));
   console.log('  Upstream: https://' + CONFIG.target_host + (CONFIG.target_path_prefix || ''));
   console.log('  Key 数: ' + keyPool.length);
-  console.log('  限流: ' + (CONFIG.rate_limit_rpm || 30) + ' RPM/key');
+  console.log('  限流: ' + (isRpmLimitEnabled() ? getRpmLimit() + ' RPM/key' : '关闭'));
   console.log('  功能: 思考链 | 图片转Base64 | Function Call修复 | JSON清理 | 多Key轮询 | 飞书告警 | Metrics | 环境变量覆盖');
   console.log('========================================');
 });
