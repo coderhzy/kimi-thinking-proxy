@@ -19,7 +19,7 @@ const DEFAULT_CONFIG = {
   local_rate_limit_enabled: false,
   rate_limit_rpm: 0,
   rpm_wait_max_ms: 0,
-  max_retries: 2,
+  max_retries: 0,
   request_timeout_ms: 120000,
   disable_backoff_ms: [60000, 300000, 900000, 1800000, 3600000],
   quota_disable_ms: 0,
@@ -28,7 +28,7 @@ const DEFAULT_CONFIG = {
     enabled: false,
     token: ''
   },
-  retry_on_http_error: true,
+  retry_on_http_error: false,
   keys: [],
   models: [
     { id: 'kimi-thinking', name: 'Kimi Thinking' },
@@ -123,6 +123,7 @@ function loadConfig() {
     cfg.rpm_wait_max_ms = envNumber('RPM_WAIT_MAX_MS', cfg.rpm_wait_max_ms);
     cfg.max_retries = envNumber('MAX_RETRIES', cfg.max_retries);
     cfg.request_timeout_ms = envNumber('REQUEST_TIMEOUT_MS', cfg.request_timeout_ms);
+    cfg.retry_on_http_error = envBool('RETRY_ON_HTTP_ERROR', cfg.retry_on_http_error);
 
     if (process.env.KIMI_KEYS) {
       cfg.keys = process.env.KIMI_KEYS.split(',').map((key, index) => ({
@@ -178,10 +179,11 @@ function initKeyPool() {
       old.name = item.name || old.name;
       old.note = item.note || '';
       old.weight = weight;
-      if (!configEnabled) {
-        old.enabled = false;
-      } else if (old.enabled === false && !old.disabledUntil) {
-        old.enabled = true;
+      old.enabled = configEnabled;
+      if (configEnabled) {
+        // Runtime upstream errors must not keep a key locally disabled across reloads.
+        old.disabledUntil = 0;
+        old.disableTier = 0;
       }
       return old;
     }
@@ -420,32 +422,14 @@ function markKeyError(keyObj, message, options) {
   keyObj.lastErrorTime = Date.now();
   bumpHistory(keyObj, 'errors');
 
-  if (isTransient) {
-    return;
+  if (!isTransient) {
+    keyObj.consecutiveErrors += 1;
   }
 
-  keyObj.consecutiveErrors += 1;
-
-  if (keyObj.consecutiveErrors < 3) return;
-
-  const backoff = CONFIG.disable_backoff_ms || DEFAULT_CONFIG.disable_backoff_ms;
-  const tier = Math.min(keyObj.disableTier, backoff.length - 1);
-  const duration = backoff[tier];
-  keyObj.enabled = false;
-  keyObj.disabledUntil = Date.now() + duration;
-  keyObj.disableTier = Math.min(keyObj.disableTier + 1, backoff.length - 1);
-  keyObj.consecutiveErrors = 0;
-
-  const humanDur = duration >= 60000
-    ? `${Math.round(duration / 60000)} 分钟`
-    : `${Math.round(duration / 1000)} 秒`;
-  console.log('[WARN] Key', keyObj.name, `连续失败，禁用 ${humanDur} (tier ${tier})`);
-
-  if (duration >= 3600000) {
-    sendFeishu(`[Kimi Proxy] Key ${keyObj.name} 连续失败，禁用 ${humanDur}\n原因: ${keyObj.lastError}`);
-  }
+  // Do not locally disable a key because of request-time upstream/transport errors.
+  // Client-visible business errors should come from the upstream response itself;
+  // local disabling can turn a real upstream 4xx/5xx into a proxy-generated 503.
 }
-
 function saveConfigToDisk() {
   const snapshot = {
     port: CONFIG.port,
@@ -474,26 +458,28 @@ function saveConfigToDisk() {
 }
 
 function shouldRetryStatus(statusCode, body) {
-  if (!CONFIG.retry_on_http_error) return false;
-  if (statusCode === 401) return true;
-  if (statusCode >= 500) return true;
-  if (isRateLimitError(statusCode)) return true;
-  if (isQuotaError(statusCode, body)) return true;
+  void statusCode;
+  void body;
+  // Never retry an upstream HTTP response. If upstream returned 4xx/5xx,
+  // that exact response should be the client-visible error source.
   return false;
+}
+
+function getMaxRetries() {
+  const n = Number(CONFIG.max_retries);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
 }
 
 function markKeyDead(keyObj, reason) {
   if (!keyObj) return;
-  keyObj.enabled = false;
-  keyObj.disabledUntil = Date.now() + 365 * 24 * 60 * 60 * 1000;
   keyObj.lastError = reason || 'key invalid';
   keyObj.lastErrorTime = Date.now();
   keyObj.errorCount += 1;
+  keyObj.consecutiveErrors += 1;
   bumpHistory(keyObj, 'errors');
-  console.log('[ERROR] Key', keyObj.name, '已永久禁用:', keyObj.lastError);
-  sendFeishu(`[Kimi Proxy] Key ${keyObj.name} 失效，已永久禁用\n原因: ${keyObj.lastError}`);
+  console.log('[WARN] Key', keyObj.name, '上游认证失败，本地不禁用:', keyObj.lastError);
+  sendFeishu(`[Kimi Proxy] Key ${keyObj.name} 上游认证失败，本地不禁用\n原因: ${keyObj.lastError}`);
 }
-
 function runChatTest(keyObj, callback) {
   const cfg = CONFIG.probe_check || {};
   const probeModel = cfg.model || 'kimi-for-coding';
@@ -879,7 +865,7 @@ function proxyRequest(req, res, bodyStr, keyObj, retryCount) {
 
     if (isStream) {
       const isError = proxyRes.statusCode >= 400;
-      if (isError && retryCount < (CONFIG.max_retries || 2) && shouldRetryStatus(proxyRes.statusCode)) {
+      if (isError && retryCount < getMaxRetries() && shouldRetryStatus(proxyRes.statusCode)) {
         const chunks = [];
         proxyRes.on('data', c => chunks.push(c));
         proxyRes.on('end', function () {
@@ -948,7 +934,7 @@ function proxyRequest(req, res, bodyStr, keyObj, retryCount) {
         }
         stats.requestsFailed += 1;
 
-        if (retryCount < (CONFIG.max_retries || 2) && shouldRetryStatus(proxyRes.statusCode, respBody)) {
+        if (retryCount < getMaxRetries() && shouldRetryStatus(proxyRes.statusCode, respBody)) {
           const nextKey = getNextKey(keyObj);
           if (nextKey) {
             console.log(`[INFO] HTTP ${proxyRes.statusCode} on ${keyObj.name}, 切换到 ${nextKey.name} 重试`);
@@ -998,7 +984,7 @@ function proxyRequest(req, res, bodyStr, keyObj, retryCount) {
     stats.upstreamNetworkErrors += 1;
     markKeyError(keyObj, error.message, { transient: true });
 
-    if (retryCount < (CONFIG.max_retries || 2)) {
+    if (retryCount < getMaxRetries()) {
       const nextKey = getNextKey(keyObj);
       if (nextKey) {
         stats.retriesTotal += 1;
@@ -1039,8 +1025,8 @@ function adminSendJson(res, statusCode, body) {
 }
 
 function deriveKeyState(k, rpm) {
-  if (k.probeStatus === 'invalid') return { level: 'dead', label: '失效', reason: 'HTTP 401 / key 过期' };
-  if (k.probeStatus === 'forbidden') return { level: 'dead', label: '已屏蔽', reason: 'HTTP 403' };
+  if (k.probeStatus === 'invalid') return { level: 'warn', label: '上游401', reason: 'HTTP 401（本地不禁用）' };
+  if (k.probeStatus === 'forbidden') return { level: 'warn', label: '上游403', reason: 'HTTP 403（本地不禁用）' };
   if (!k.enabled) {
     return { level: 'paused', label: '暂禁', reason: `退避 tier ${k.disableTier}` };
   }
@@ -1220,8 +1206,8 @@ dialog::backdrop{background:rgba(0,0,0,.6)}
 <div class="field"><label>rate_limit_rpm (启用限流时，单 key 每分钟最大请求数)</label><input id="s_rate_limit_rpm" type="number" min="0"></div>
 <div class="field"><label>rpm_wait_max_ms (RPM 满时等待 ms，0=不等；限流关闭时忽略)</label><input id="s_rpm_wait_max_ms" type="number" min="0" step="500"></div>
 <div class="field"><label>quota_disable_ms (兼容旧配置；上游额度/频限现在本地不禁用)</label><input id="s_quota_disable_ms" type="number" min="0" step="60000"></div>
-<div class="field"><label>disable_backoff_ms (连续失败退避阶梯，逗号分隔 ms)</label><input id="s_disable_backoff_ms" placeholder="60000,300000,900000,1800000,3600000"></div>
-<div class="field"><label>max_retries (单请求最大重试次数)</label><input id="s_max_retries" type="number" min="0"></div>
+<div class="field"><label>disable_backoff_ms (兼容旧配置；请求期上游错误不再本地禁用 key)</label><input id="s_disable_backoff_ms" placeholder="60000,300000,900000,1800000,3600000"></div>
+<div class="field"><label>max_retries (网络错误重试次数；默认 0，避免本服务改写上游结果)</label><input id="s_max_retries" type="number" min="0"></div>
 <div class="field"><label>request_timeout_ms (上游请求超时)</label><input id="s_request_timeout_ms" type="number" min="1000" step="1000"></div>
 <div class="row"><button class="secondary" id="setCancel">取消</button><button id="setSave">保存</button></div>
 </dialog>
@@ -1621,7 +1607,7 @@ function handleAdminRequest(req, res) {
       rpm_wait_max_ms: CONFIG.rpm_wait_max_ms != null ? CONFIG.rpm_wait_max_ms : 0,
       quota_disable_ms: CONFIG.quota_disable_ms != null ? CONFIG.quota_disable_ms : 0,
       disable_backoff_ms: CONFIG.disable_backoff_ms || DEFAULT_CONFIG.disable_backoff_ms,
-      max_retries: CONFIG.max_retries != null ? CONFIG.max_retries : 2,
+      max_retries: CONFIG.max_retries != null ? CONFIG.max_retries : 0,
       request_timeout_ms: CONFIG.request_timeout_ms || 120000
     });
     return true;

@@ -57,9 +57,11 @@ Key fields:
 - `local_rate_limit_enabled`: enable local per-key RPM limiting; default `false`
 - `rate_limit_rpm`: per-key requests per minute when local RPM limiting is enabled
 - `quota_disable_ms`: legacy compatibility value; upstream quota/rate-limit responses are recorded but do not locally disable keys
-- `max_retries`: retry count on upstream/network failure
+- `max_retries`: network retry count; default `0` so client-visible errors come from the upstream whenever an upstream HTTP response exists
 - `request_timeout_ms`: upstream timeout
 - `auto_thinking`: inject `enable_thinking=true` when absent
+
+Error handling is upstream-first: upstream HTTP status codes are passed through, upstream 4xx/5xx do not locally disable keys, and upstream HTTP responses are never retried or replaced by another key. The proxy only returns its own error when it cannot obtain an upstream HTTP response, or when no configured key is locally available.
 - `telegram.enabled`: send basic failure alerts
 
 ## Environment variables
@@ -78,6 +80,7 @@ All important config values can be overridden with env vars:
 - `RPM_WAIT_MAX_MS`
 - `MAX_RETRIES`
 - `REQUEST_TIMEOUT_MS`
+- `RETRY_ON_HTTP_ERROR` (kept for compatibility; upstream HTTP responses are still not retried)
 - `KIMI_KEYS` (comma-separated)
 - `TELEGRAM_ENABLED`
 - `TELEGRAM_BOT_TOKEN`
